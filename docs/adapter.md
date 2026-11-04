@@ -153,3 +153,18 @@ Both command modes passed small near-home checks on one installation.
 This does not qualify arbitrary trajectories or prove speed parity. Resolve
 boundary overshoot before full-workspace speed qualification. Compare equivalent interior-workspace trajectories and measure
 actual movement time separately from model inference time.
+
+## Wrist yaw endpoint clearance
+
+`wrist_yaw_command_margin_rad` narrows only joint 5's IK command range at
+both ends. It defaults to zero. It does not change the motor profile, measured
+position tolerance, torque limits, feedback checks, or other joint ranges.
+The solver clips its seed to the reduced range, including when the measured
+position starts outside that command range. Invalid margins fail at construction.
+
+The manufacturer lists joint 5 travel as +/-90 degrees:
+https://wiki.seeedstudio.com/rebot_arm_b601_rs_pinocchio_meshcat/
+This matches the shipped profile. It does not specify allowable dynamic
+overshoot beyond that range. A station can use endpoint clearance to allow
+tracking error without commanding the exact range endpoint. Clearance requires
+hardware validation and is not a replacement for the measured-position stop.

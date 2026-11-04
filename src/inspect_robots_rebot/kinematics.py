@@ -45,7 +45,13 @@ class Solution:
 class Kinematics:
     """Use YAM's base-frame and trial-relative yaw, pitch, and roll convention."""
 
-    def __init__(self, config: ArmConfig, *, tool_floor_m: float = 0.12) -> None:
+    def __init__(
+        self,
+        config: ArmConfig,
+        *,
+        tool_floor_m: float = 0.12,
+        wrist_yaw_command_margin_rad: float = 0.0,
+    ) -> None:
         if not np.isfinite(tool_floor_m) or tool_floor_m >= 0.6:
             raise ValueError("tool_floor_m must be finite and below the 0.6 m upper bound")
         self.tool_floor_m = float(tool_floor_m)
@@ -57,6 +63,11 @@ class Kinematics:
         self._rotation = Rotation
         self.lower = np.array([j["lower"] for j in config.axes[:6]], dtype=np.float64)
         self.upper = np.array([j["upper"] for j in config.axes[:6]], dtype=np.float64)
+        margin = wrist_yaw_command_margin_rad
+        if not np.isfinite(margin) or margin < 0 or 2 * margin >= self.upper[4] - self.lower[4]:
+            raise ValueError("Wrist yaw command margin must leave a nonempty joint range")
+        self.lower[4] += margin
+        self.upper[4] -= margin
         self.reference: Vec | None = None
 
     def capture_reference(self, q: npt.ArrayLike) -> None:

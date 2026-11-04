@@ -54,6 +54,7 @@ class RebotEmbodiment(EmbodimentBase):
         allow_motion: bool = False,
         motor_temp_limit: float = 80,
         tool_floor_m: float = 0.12,
+        wrist_yaw_command_margin_rad: float = 0.0,
         command_mode: str = "measured",
         command_step_rad: float = 0.2,
         command_resync_rad: float = 0.35,
@@ -95,6 +96,14 @@ class RebotEmbodiment(EmbodimentBase):
         ]
         if self.configs[0].state_dir == self.configs[1].state_dir:
             raise ValueError("Each arm requires its own persistent stop directory")
+        margin = wrist_yaw_command_margin_rad
+        if (
+            not np.isfinite(margin)
+            or margin < 0
+            or any(2 * margin >= c.axes[4]["upper"] - c.axes[4]["lower"] for c in self.configs)
+        ):
+            raise ValueError("Wrist yaw command margin must leave a nonempty joint range")
+        self.wrist_yaw_command_margin_rad = margin
         self.allow_motion, self.motor_temp_limit = allow_motion, motor_temp_limit
         self.camera_url = camera_url
         self._session_factory = session_factory or StreamingSession
@@ -184,7 +193,12 @@ class RebotEmbodiment(EmbodimentBase):
             self._camera = factory(self.camera_url)
             self._camera.get()
             self.kinematics = [
-                Kinematics(config, tool_floor_m=self.tool_floor_m) for config in self.configs
+                Kinematics(
+                    config,
+                    tool_floor_m=self.tool_floor_m,
+                    wrist_yaw_command_margin_rad=self.wrist_yaw_command_margin_rad,
+                )
+                for config in self.configs
             ]
             for config in self.configs:
                 session = self._session_factory(

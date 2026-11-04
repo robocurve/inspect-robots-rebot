@@ -612,3 +612,25 @@ def test_failed_path_does_not_advance_command_reference(session):
 def test_invalid_command_configuration(tmp_path, kwargs):
     with pytest.raises(ValueError):
         RebotEmbodiment(state_dir=str(tmp_path), **kwargs)
+
+
+@pytest.mark.parametrize("margin", [-0.01, float("nan"), float("inf"), 2.0])
+def test_invalid_wrist_command_margin(config, tmp_path, margin):
+    with pytest.raises(ValueError, match="margin"):
+        Kinematics(config, wrist_yaw_command_margin_rad=margin)
+    with pytest.raises(ValueError, match="margin"):
+        RebotEmbodiment(state_dir=str(tmp_path), wrist_yaw_command_margin_rad=margin)
+
+
+def test_wrist_margin_bounds_ik_without_changing_motor_profile(config):
+    kin = Kinematics(config, wrist_yaw_command_margin_rad=0.03)
+    plain = Kinematics(config)
+    q = np.array([0.0, 0.8, 0.7, 0.3, config.axes[4]["lower"], 0.0])
+    kin.capture_reference(q)
+    target = kin.observe(q, 0)
+    result = kin.solve(target, q)
+    assert result.joints[4] >= config.axes[4]["lower"] + 0.03
+    assert kin.upper[4] == pytest.approx(config.axes[4]["upper"] - 0.03)
+    assert plain.lower[4] == config.axes[4]["lower"]
+    assert kin.lower[:4] == pytest.approx(plain.lower[:4])
+    assert kin.upper[5] == plain.upper[5]
