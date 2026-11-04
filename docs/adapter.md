@@ -63,8 +63,10 @@ before configuration; interface names alone do not prove arm identity.
   and rotation residuals. A finite result inside bounds does not prove a target
   was reached. Read the measured `eef_state`.
 - The command is limited to 0.08 rad ahead of arm feedback and 0.44 rad ahead of
-  gripper feedback. The corresponding tracking stops remain 0.09 and 0.45 rad.
-  This 0.01 rad margin avoids commanding exactly at the fault boundary.
+  gripper feedback. The native command-lead allowances are 0.09 and 0.45 rad.
+  These are not motor fault thresholds. The native loss-of-control envelopes
+  remain 0.6 rad for arm joints and 5 rad for the gripper. Feedback is checked
+  against those envelopes before a command is sent.
 - No additional velocity, acceleration, or jerk planner runs on policy targets.
   The tracking allowance still affects attainable speed. Native homing retains
   its separate slow path behavior. This does not promise YAM's physical speed.
@@ -118,7 +120,7 @@ above rather than presented as identical YAM behavior.
 
 Hardware-free tests cover lifecycle rollback, both-arm cleanup, finite/bounded IK,
 joint-boundary solutions, calibrated grippers, stale/invalid feedback, temperature
-and torque faults, tracking margin, disable acknowledgement, and camera failures.
+and torque faults, command-lead margin, native envelope faults, disable acknowledgement, and camera failures.
 Before an overnight queue, test the installed package and driver together, inspect
 both-arm motion and shutdown, and complete a short live RoboComms trial. Record the
 package commit, driver build, station profiles, and trial result outside this public

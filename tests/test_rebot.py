@@ -166,9 +166,8 @@ def test_stream_margin_and_nonblocking_feedback(session):
     session._motors[6].position = -0.001
     session._check_envelope()  # 0.441 < 0.45: does not latch on the command boundary.
     session._motors[6].position = -0.02
-    with pytest.raises(RuntimeError, match="tracking stop"):
-        session._check_envelope()
-    assert session.pair_stop.is_set()
+    session._check_envelope()  # Command lead is not the loss-of-control envelope.
+    assert not session.pair_stop.is_set()
     session._streaming = False
     session._enabled = False
 
@@ -495,3 +494,26 @@ def test_pair_cleanup_error_preserves_primary(tmp_path):
 def test_same_state_directory_rejected(tmp_path):
     with pytest.raises(ValueError, match="own persistent"):
         RebotEmbodiment(left_state_dir=str(tmp_path), right_state_dir=str(tmp_path))
+
+
+def test_recorded_joint2_following_error_is_not_a_native_fault(session):
+    session._command = [0.0] * 7
+    session._motors[1].position = 0.0912748575
+    session._check_envelope()
+    assert not session.pair_stop.is_set()
+
+
+def test_native_envelope_uses_fresh_snapshot_and_still_stops(session):
+    # The parameter-poll cache can be older than the streamed reply.
+    session._positions = (0.0,) * 7
+    session._command = [0.0] * 7
+    session._motors[1].position = 0.601
+    with pytest.raises(RuntimeError, match="command envelope exceeded"):
+        session._check_envelope()
+    assert session.pair_stop.is_set()
+
+
+def test_pair_stop_does_not_interrupt_native_parking(session):
+    session.pair_stop.set()
+    session._parking = True
+    session._check_envelope()

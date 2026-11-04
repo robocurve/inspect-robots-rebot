@@ -38,6 +38,7 @@ class StreamingSession(native.ArmSession):
         self.motor_temp_limit = motor_temp_limit
         self.pair_stop = pair_stop or threading.Event()
         self._streaming = False
+        self._parking = False
         self.shutdown_errors: list[str] = []
         self.shutdown_report: dict[str, Any] = {}
         self._over_cap_since: float | None = None
@@ -145,7 +146,7 @@ class StreamingSession(native.ArmSession):
         *,
         validate: Callable[[Sequence[float], Sequence[float]], None] | None = None,
     ) -> tuple[float, ...]:
-        """Set a bounded target with a margin inside the native tracking stop."""
+        """Set a target inside the native command-lead allowance."""
         requested = tuple(float(v) for v in target)
         if len(requested) != len(self.joints) or not all(math.isfinite(v) for v in requested):
             raise ValueError("A position command requires one finite value per motor")
@@ -182,20 +183,21 @@ class StreamingSession(native.ArmSession):
         if self._failure is not None:
             return
         try:
-            if self.pair_stop.is_set():
+            if self.pair_stop.is_set() and not self._parking:
                 raise native._EnvelopeError("The other arm stopped")
             sample = self.feedback()
-            super()._check_envelope()
-            if self._streaming:
-                for i, (position, command) in enumerate(
-                    zip(sample.positions, self._command, strict=True)
-                ):
-                    reach = self._axis_limit(i, native.HOLD_REACH, native.GRIPPER_REACH)
-                    if abs(position - command) > reach + 1e-12:
-                        raise native._EnvelopeError(
-                            f"{self.joints[i]['name']}: tracking stop; measured={position:.5f}, "
-                            f"command={command:.5f}, limit={reach:.3f} rad"
-                        )
+            # HOLD_REACH limits a new command. It is not a motor fault threshold.
+            # Use current snapshot positions with the native loss-of-control envelope.
+            for i, (position, command) in enumerate(
+                zip(sample.positions, self._command, strict=True)
+            ):
+                envelope = self._axis_limit(i, native.MAX_EXCURSION, native.GRIPPER_EXCURSION)
+                if abs(position - command) > envelope:
+                    raise native._EnvelopeError(
+                        f"{self.joints[i]['name']}: command envelope exceeded; "
+                        f"measured={position:.5f}, command={command:.5f}, "
+                        f"limit={envelope:.3f} rad"
+                    )
         except native._EnvelopeError:
             self.pair_stop.set()
             raise
@@ -265,6 +267,7 @@ class StreamingSession(native.ArmSession):
         self._closed = True
         with self._condition:
             self._streaming = False
+            self._parking = True
         try:
             self._home_then_disable()
         except BaseException as error:
