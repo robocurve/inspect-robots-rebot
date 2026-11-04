@@ -53,6 +53,7 @@ class RebotEmbodiment(EmbodimentBase):
         camera_url: str = "",
         allow_motion: bool = False,
         motor_temp_limit: float = 80,
+        rs00_mos_temp_limit: float | None = None,
         tool_floor_m: float = 0.12,
         wrist_yaw_command_margin_rad: float = 0.0,
         joint2_upper_tolerance_rad: float = 0.01,
@@ -113,6 +114,10 @@ class RebotEmbodiment(EmbodimentBase):
         ):
             raise ValueError("Wrist yaw command margin must leave a nonempty joint range")
         self.wrist_yaw_command_margin_rad = margin
+        mos_limit = motor_temp_limit if rs00_mos_temp_limit is None else rs00_mos_temp_limit
+        if not np.isfinite(mos_limit) or not 0 < mos_limit <= 100:
+            raise ValueError("rs00_mos_temp_limit must be in (0, 100] C")
+        self.rs00_mos_temp_limit = mos_limit
         self.allow_motion, self.motor_temp_limit = allow_motion, motor_temp_limit
         self.camera_url = camera_url
         self._session_factory = session_factory or StreamingSession
@@ -148,6 +153,7 @@ class RebotEmbodiment(EmbodimentBase):
         fields = [
             StateField("joint_pos", (2, 7), "rad+normalized"),
             StateField("eef_state", (14,), "m+rad+normalized"),
+            StateField("blocked", (2, 6), "direction"),
         ]
         if report_joint_eff:
             fields.append(StateField("joint_eff", (2, 7), "Nm"))
@@ -179,6 +185,9 @@ class RebotEmbodiment(EmbodimentBase):
             "Targets use bounded IK. Read eef_state to see actual movement. "
             "Commands run at 10 Hz without an added speed, acceleration, or jerk planner. "
             "The native tracking allowance can shorten a move; step info reports this. "
+            "A high-effort joint with no progress holds at its measured position. "
+            "State blocked reports -1 or +1 for the blocked joint direction; choose a pose "
+            "that moves that joint back before pushing in that direction again. "
             "Joint bounds, torque caps, fresh feedback, temperature and watchdog stops apply. "
             "No inter-arm collision model is provided. " + docs_extra,
         )
@@ -215,6 +224,7 @@ class RebotEmbodiment(EmbodimentBase):
                     config.state_dir,
                     home_wait=240,
                     motor_temp_limit=self.motor_temp_limit,
+                    rs00_mos_temp_limit=self.rs00_mos_temp_limit,
                     pair_stop=pair_stop,
                     joint2_upper_tolerance_rad=self.joint2_upper_tolerance_rad,
                     **self.command_options,
@@ -253,7 +263,11 @@ class RebotEmbodiment(EmbodimentBase):
             poses.extend(kin.observe(q[:6], grip))
             efforts.append(sample.efforts)
             times.append(sample.time)
-        state = {"joint_pos": np.array(joints), "eef_state": np.array(poses)}
+        state = {
+            "joint_pos": np.array(joints),
+            "eef_state": np.array(poses),
+            "blocked": np.array([getattr(s, "blocked", [0.0] * 6) for s in self.sessions]),
+        }
         if self._report_effort:
             state["joint_eff"] = np.array(efforts)
         frame = self._camera.get()

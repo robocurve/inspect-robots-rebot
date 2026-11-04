@@ -29,6 +29,7 @@ class StreamingSession(native.ArmSession):
         self,
         *args: Any,
         motor_temp_limit: float = 80.0,
+        rs00_mos_temp_limit: float | None = None,
         pair_stop: threading.Event | None = None,
         joint2_upper_tolerance_rad: float = native.BOUNDS_TOLERANCE,
         command_mode: str = "measured",
@@ -57,6 +58,10 @@ class StreamingSession(native.ArmSession):
         self.command_step_rad = command_step_rad
         self.command_resync_rad = command_resync_rad
         self.command_resynced = False
+        mos_limit = motor_temp_limit if rs00_mos_temp_limit is None else rs00_mos_temp_limit
+        if not math.isfinite(mos_limit) or not 0 < mos_limit <= 100:
+            raise ValueError("rs00_mos_temp_limit must be in (0, 100] C")
+        self.rs00_mos_temp_limit = mos_limit
         self.motor_temp_limit = motor_temp_limit
         self.pair_stop = pair_stop or threading.Event()
         self._streaming = False
@@ -64,6 +69,9 @@ class StreamingSession(native.ArmSession):
         self.shutdown_errors: list[str] = []
         self.shutdown_report: dict[str, Any] = {}
         self._over_cap_since: float | None = None
+        self.blocked = [0.0] * 6
+        self._blocked_at = [0.0] * 6
+        self._stall_progress: list[tuple[float, float] | None] = [None] * 6
 
     def open(self) -> StreamingSession:
         """Claim the bus and require timestamped driver feedback before activation."""
@@ -104,9 +112,14 @@ class StreamingSession(native.ArmSession):
                     raise native._FeedbackError(f"{axis['name']}: stale feedback ({age:.3f} s)")
                 if state.status_code:
                     raise native._EnvelopeError(f"{axis['name']}: motor status {state.status_code}")
-                if not 0 < temperature < self.motor_temp_limit:
+                mos_limit = (
+                    self.rs00_mos_temp_limit if axis["model"] == "rs-00" else self.motor_temp_limit
+                )
+                if temperature <= 0 or mos >= mos_limit or rotor >= self.motor_temp_limit:
                     raise native._EnvelopeError(
-                        f"{axis['name']}: temperature stop ({temperature:.1f} C)"
+                        f"{axis['name']}: temperature stop "
+                        f"(MOS={mos:.1f}/{mos_limit:.1f} C, "
+                        f"rotor={rotor:.1f}/{self.motor_temp_limit:.1f} C)"
                     )
                 upper_tolerance = (
                     self.joint2_upper_tolerance_rad
@@ -194,11 +207,18 @@ class StreamingSession(native.ArmSession):
                 if resynced:
                     reference = measured
             command = []
+            blocked = list(self.blocked)
             for i, (value, actual, low, high) in enumerate(
                 zip(requested, measured, self.lower, self.upper, strict=True)
             ):
                 if not low <= value <= high:
                     raise ValueError("Position command exceeds joint bounds")
+                if i < 6 and blocked[i]:
+                    delta = (value - self._blocked_at[i]) * blocked[i]
+                    if delta < -0.01:
+                        blocked[i] = 0.0
+                    elif delta > 0:
+                        value = self._blocked_at[i]
                 reach = self._axis_limit(i, native.HOLD_REACH, native.GRIPPER_REACH) - 0.01
                 anchor = actual
                 if self.command_mode == "previous" and i < 6:
@@ -206,6 +226,7 @@ class StreamingSession(native.ArmSession):
                 command.append(max(low, min(high, max(anchor - reach, min(anchor + reach, value)))))
             if validate is not None:
                 validate(measured, command)
+            self.blocked = blocked
             self.command_resynced = resynced
             self._streaming = True
             self._command = command
@@ -219,6 +240,35 @@ class StreamingSession(native.ArmSession):
             self._path = self._goal = None
             self._command = self._clamp(self._positions)
             self._condition.notify_all()
+
+    def _relieve_stalls(self, sample: Feedback) -> None:
+        """Hold a high-effort joint that makes no progress, including during inference."""
+        if not self._streaming or self._parking:
+            self._stall_progress = [None] * 6
+            return
+        now = self._clock()
+        for i in range(6):
+            position = sample.positions[i]
+            gap = self._command[i] - position
+            if abs(gap) <= native.TOLERANCE or abs(sample.efforts[i]) < 0.9 * self.caps[i]:
+                self._stall_progress[i] = None
+                continue
+            previous = self._stall_progress[i]
+            if previous is None or abs(position - previous[0]) > 0.005:
+                self._stall_progress[i] = (position, now)
+            elif now - previous[1] >= 0.5:
+                self.blocked[i] = math.copysign(1.0, gap)
+                self._blocked_at[i] = max(self.lower[i], min(self.upper[i], position))
+                self._command[i] = self._blocked_at[i]
+                self._stall_progress[i] = None
+                self._log(
+                    "stream-stalled",
+                    joint=self.joints[i]["name"],
+                    measured_rad=position,
+                    command_gap_rad=gap,
+                    effort_nm=sample.efforts[i],
+                    blocked_direction=self.blocked[i],
+                )
 
     def _check_envelope(self) -> None:
         if self._failure is not None:
@@ -239,6 +289,7 @@ class StreamingSession(native.ArmSession):
                         f"measured={position:.5f}, command={command:.5f}, "
                         f"limit={envelope:.3f} rad"
                     )
+            self._relieve_stalls(sample)
         except native._EnvelopeError:
             self.pair_stop.set()
             raise

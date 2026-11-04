@@ -175,3 +175,21 @@ For an installation with a reduced joint 2 operating range,
 tolerance remains inside the stock profile's 170-degree upper bound. This
 option changes only the upper measured-position allowance for joint 2.
 It does not change commands, lower bounds, other joints, or other fault checks.
+
+## Controller temperature and stalled commands
+
+`rs00_mos_temp_limit` sets a separate MOS/controller temperature cutoff for
+RS-00 motors, up to 100 C. By default it follows `motor_temp_limit`. The general
+limit remains capped at 80 C and still applies to RS-06 MOS readings and all
+rotor readings. A deployment must establish which sensor the manufacturer's
+operating advice covers; support for a configuration value is not a hardware
+rating or a guarantee that a stalled pose can be held indefinitely.
+
+The streaming loop now holds an arm joint at its measured position when effort
+is at least 90% of its configured cap, command error exceeds 0.08 rad, and the
+joint fails to move by more than 0.005 rad for 0.5 seconds. This also runs while
+the policy waits for model inference. State `blocked` reports the direction;
+a command more than 0.01 rad in the reverse direction releases the block.
+The gripper and native parking path retain their existing behavior. Normal
+moving joints retain the configured command step. Fault checks run before this
+stall response, so it cannot hide a position, temperature, or tracking fault.

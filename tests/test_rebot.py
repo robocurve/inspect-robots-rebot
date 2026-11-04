@@ -676,3 +676,85 @@ def test_reduced_joint2_range_accepts_narrow_tolerance(config, tmp_path):
     s = StreamingSession(profile, config.state_dir, joint2_upper_tolerance_rad=0.012)
     assert s.joint2_upper_tolerance_rad == 0.012
     assert s.joints[1]["upper"] == 1.6
+
+
+@pytest.mark.parametrize("limit", [0, -1, 101, float("nan"), float("inf")])
+def test_invalid_rs00_mos_limit(config, tmp_path, limit):
+    with pytest.raises(ValueError, match="rs00_mos_temp_limit"):
+        StreamingSession(config.profile, config.state_dir, rs00_mos_temp_limit=limit)
+    with pytest.raises(ValueError, match="rs00_mos_temp_limit"):
+        RebotEmbodiment(state_dir=str(tmp_path), rs00_mos_temp_limit=limit)
+
+
+def test_rs00_mos_limit_does_not_raise_rs06_or_rotor_limit(session):
+    session.rs00_mos_temp_limit = 100
+    session._motors[3].temperature = 99
+    session.feedback()
+    session._motors[3].temperature = 100
+    with pytest.raises(Exception, match="joint4: temperature stop"):
+        session.feedback()
+    session._motors[3].temperature = 99
+    session._motors[0].temperature = 80
+    with pytest.raises(Exception, match="joint1: temperature stop"):
+        session.feedback()
+    session._motors[0].temperature = 30
+    motor = session._motors[3]
+    original = motor.get_state_snapshot
+
+    def hot_rotor():
+        snapshot = original()
+        snapshot.state.t_rotor = 80
+        return snapshot
+
+    motor.get_state_snapshot = hot_rotor
+    with pytest.raises(Exception, match=r"rotor=80\.0/80\.0"):
+        session.feedback()
+
+
+def test_rs00_default_follows_lower_general_temperature_limit(config, tmp_path):
+    s = StreamingSession(config.profile, config.state_dir, motor_temp_limit=65)
+    assert s.rs00_mos_temp_limit == 65
+    e = RebotEmbodiment(state_dir=str(tmp_path), motor_temp_limit=65)
+    assert e.rs00_mos_temp_limit == 65
+
+
+@pytest.mark.parametrize("direction", [-1, 1])
+def test_saturated_stall_holds_and_requires_reverse_request(session, direction):
+    session.activate()
+    session._stop.set()
+    session._thread.join(1)
+    now = [0.0]
+    session._clock = lambda: now[0]
+    session._streaming = True
+    session._command[3] = 0.4 * direction
+    sample = Feedback((0.0,) * 7, (0, 0, 0, session.caps[3], 0, 0, 0), (35.0,) * 7, 0)
+    session._relieve_stalls(sample)
+    now[0] = 0.49
+    session._relieve_stalls(sample)
+    assert session._command[3] == 0.4 * direction
+    now[0] = 0.51
+    session._relieve_stalls(sample)
+    assert session._command[3] == 0
+    assert session.blocked[3] == direction
+    command = session.set_position([0, 0, 0, 0.4 * direction, 0, 0, 0])
+    assert command[3] == 0
+    command = session.set_position([0, 0, 0, -0.02 * direction, 0, 0, 0])
+    assert command[3] * direction < 0
+    assert session.blocked[3] == 0
+    session._enabled = False
+
+
+def test_moving_high_effort_joint_is_not_blocked(session):
+    now = [0.0]
+    session._clock = lambda: now[0]
+    session._streaming = True
+    session._command[3] = 0.5
+    for i in range(10):
+        now[0] += 0.2
+        q = [0.0] * 7
+        q[3] = i * 0.006
+        session._relieve_stalls(
+            Feedback(tuple(q), (0, 0, 0, session.caps[3], 0, 0, 0), (35.0,) * 7, now[0])
+        )
+    assert not any(session.blocked)
+    assert session._command[3] == 0.5
