@@ -387,6 +387,18 @@ class ArmSession:
                         if self._path is not None:
                             self._check_path(now)
                 except _EnvelopeError as error:
+                    if isinstance(error, _FeedbackError) and getattr(
+                        self, "_disable_on_feedback_loss", False
+                    ):
+                        self._failure = error
+                        self._lost_control = True
+                        self._path = self._goal = None
+                        self._latch("arm feedback lost", {"error": str(error)})
+                        try:
+                            self._disable()
+                        finally:
+                            self._condition.notify_all()
+                        break
                     # Keep control: latch the stop, hold where the arm is, let the owner walk home.
                     self._latch(
                         "arm session stopped",

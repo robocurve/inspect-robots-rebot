@@ -129,25 +129,48 @@ class MotorLog:
         self._next_sample_ns = max(slot + self._period_ns, now - self._period_ns // 2)
         states: dict[str, tuple[object, object]] = {}
         raw: dict[str, dict[str, Any] | None] = {}
+        freshness: dict[str, dict[str, Any]] = {}
         for name, motor in zip(self.names, motors, strict=False):
             try:
-                state = motor.get_state()
+                reader = getattr(motor, "get_state_snapshot", None)
+                if callable(reader):
+                    snapshot = reader()
+                    age = None if snapshot is None else float(snapshot.feedback_age_s)
+                    fresh = age is not None and math.isfinite(age) and 0 <= age <= 0.1
+                    freshness[name] = {
+                        "age_s": age,
+                        "sequence": None if snapshot is None else snapshot.feedback_sequence,
+                        "fresh": fresh,
+                    }
+                    state = None if snapshot is None else snapshot.state
+                else:
+                    freshness[name] = {"age_s": None, "sequence": None, "fresh": None}
+                    state = motor.get_state()
             except Exception:
+                freshness[name] = {"age_s": None, "sequence": None, "fresh": False}
                 state = None
             if state is None:
                 states[name], raw[name] = (None, None), None
                 continue
             fields = {field: getattr(state, field, None) for field in _STATE_FIELDS}
             raw[name] = fields
-            # On this arm t_mos is the winding thermistor in whole degrees; zero means unfilled.
+            # Keep MOS/controller and rotor readings distinct in the raw record.
             readings = [
                 value
                 for value in (fields["t_mos"], fields["t_rotor"])
                 if isinstance(value, (int, float)) and math.isfinite(value) and value != 0
             ]
-            states[name] = (fields["torq"], max(readings, default=None))
+            states[name] = (
+                (None, None)
+                if freshness[name]["fresh"] is False
+                else (fields["torq"], max(readings, default=None))
+            )
         self.thermal.update(states, now / 1e9)
         thermal = self.thermal.snapshot()
+        for name, metadata in freshness.items():
+            thermal[name]["feedback_fresh"] = metadata["fresh"]
+            if metadata["fresh"] is False:
+                thermal[name]["measured_c"] = None
         for name, cap in zip(self.names, caps or (), strict=False):
             thermal[name]["cap_nm"] = None if cap is None else round(float(cap), 3)
         self._queue.put(
@@ -159,6 +182,7 @@ class MotorLog:
                     "feedforward_nm": _rounded(feedforward, 3),
                     "thermal": thermal,
                     "motors": raw,
+                    "feedback": freshness,
                     "thermal_latched": self.thermal.latched,
                 },
             )

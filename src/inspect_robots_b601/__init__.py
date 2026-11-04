@@ -19,7 +19,7 @@ try:
     from importlib.metadata import PackageNotFoundError
     from importlib.metadata import version as _pkg_version
 
-    __version__ = _pkg_version("inspect-robots-b601")
+    __version__ = _pkg_version("inspect-robots-rebot")
 except PackageNotFoundError:  # Only in a source tree that is not installed.
     __version__ = "0.0.0+unknown"
 

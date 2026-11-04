@@ -35,6 +35,9 @@ class Motor(Protocol):
     def get_state(self) -> Any:
         """The motor's last cached MIT reply, or None if it has none; sends no CAN traffic."""
 
+    def get_state_snapshot(self) -> Any:
+        """Return cached feedback with its age and receive sequence, if supported."""
+
     def enable(self) -> None:
         """Enable the motor."""
 

@@ -219,7 +219,8 @@ class LauncherTests(unittest.TestCase):
         result = self.run_script("pose", "--stage", "joint3=0.1 extra")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
-            self.logged(), [[str(self.root), "/site/state", "pose", "--stage", "joint3=0.1 extra"]]
+            self.logged(),
+            [[str(self.root.resolve()), "/site/state", "pose", "--stage", "joint3=0.1 extra"]],
         )
 
     def test_setup_installs_the_checkout_with_its_extras(self):
