@@ -193,3 +193,24 @@ a command more than 0.01 rad in the reverse direction releases the block.
 The gripper and native parking path retain their existing behavior. Normal
 moving joints retain the configured command step. Fault checks run before this
 stall response, so it cannot hide a position, temperature, or tracking fault.
+
+### Rejected paths and lost feedback
+
+A proposed path that crosses the configured tool floor returns `command_rejected=1`
+in the observation, with the reason in step information. Both arms hold their
+measured positions. The model can choose a different pose without closing the
+trial. A later accepted step clears this field. If one arm accepted a command
+before the other arm rejected its path, the first arm can have started that move;
+the hold applies to both arms. Other faults still close the trial.
+
+The paired streaming session treats missing or stale feedback as lost control.
+It cancels queued motion and attempts to disable the motors. It does not retry a
+home path with missing feedback. Disable confirmation still requires a new reply
+from every motor. A disconnected cable can prevent confirmation even when the
+software sends disable commands. Reconnection and fresh disabled-state replies
+are required before recovery.
+
+Motor logs include per-motor feedback age, sequence, and freshness. A stale
+snapshot remains in the raw evidence, but its temperature is not reported as a
+current `measured_c` value. Drivers without snapshot support report unknown
+freshness. The streaming adapter still requires snapshot support.

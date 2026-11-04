@@ -758,3 +758,53 @@ def test_moving_high_effort_joint_is_not_blocked(session):
         )
     assert not any(session.blocked)
     assert session._command[3] == 0.5
+
+
+@pytest.mark.parametrize("side", [0, 1])
+def test_floor_rejection_keeps_pair_open_and_allows_next_move(tmp_path, side):
+    from inspect_robots_rebot.kinematics import PathRejected
+
+    e = RebotEmbodiment(
+        allow_motion=True, state_dir=str(tmp_path), session_factory=Arm, camera_factory=Camera
+    )
+    observation = e.reset(Scene(id="reject", instruction="move"))
+    arms = list(e.sessions)
+    for arm in arms:
+        arm.hold = Mock()
+    original = e.kinematics[side].validate_path
+    e.kinematics[side].validate_path = Mock(side_effect=PathRejected("tool floor"))
+    result = e.step(Action(observation.state["eef_state"].copy()))
+    assert result.info["command_rejected"]
+    assert result.observation.state["command_rejected"].tolist() == [1]
+    assert all(a.active and not a.closed for a in arms)
+    assert all(a.hold.call_count == 1 for a in arms)
+    e.kinematics[side].validate_path = original
+    result = e.step(Action(observation.state["eef_state"].copy()))
+    assert result.observation.state["command_rejected"].tolist() == [0]
+    e.close()
+
+
+def test_stream_feedback_loss_disables_without_home_retry(session):
+    session.activate()
+    session.go_home = Mock(side_effect=AssertionError("must not park without feedback"))
+    session._motors[0].age = 0.481
+    deadline = time.monotonic() + 2
+    while session._enabled and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert not session._enabled
+    assert session._lost_control
+    assert session.pair_stop.is_set()
+    assert "stale feedback" in str(session._failure)
+    with pytest.raises(RuntimeError, match="disable not confirmed"):
+        session.close()
+    session.go_home.assert_not_called()
+    assert not session.shutdown_report["disable_confirmed"]
+    assert session._thread is not None and not session._thread.is_alive()
+
+
+def test_short_feedback_age_does_not_stop_stream(session):
+    session.activate()
+    session._motors[0].age = 0.08
+    time.sleep(0.12)
+    assert session._enabled and session._failure is None
+    session._motors[0].age = 0

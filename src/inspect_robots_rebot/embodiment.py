@@ -27,7 +27,7 @@ from inspect_robots import (
 from inspect_robots.errors import EmbodimentFault
 
 from .config import load_arm
-from .kinematics import Kinematics
+from .kinematics import Kinematics, PathRejected
 from .session import StreamingSession
 
 LABELS = tuple(
@@ -86,6 +86,7 @@ class RebotEmbodiment(EmbodimentBase):
             "command_resync_rad": command_resync_rad,
         }
         self.tool_floor_m = float(tool_floor_m)
+        self._command_rejected = False
         self.configs = [
             load_arm(
                 left_profile, left_channel, Path(left_state_dir or str(Path(state_dir) / "left"))
@@ -154,6 +155,7 @@ class RebotEmbodiment(EmbodimentBase):
             StateField("joint_pos", (2, 7), "rad+normalized"),
             StateField("eef_state", (14,), "m+rad+normalized"),
             StateField("blocked", (2, 6), "direction"),
+            StateField("command_rejected", (1,), "boolean"),
         ]
         if report_joint_eff:
             fields.append(StateField("joint_eff", (2, 7), "Nm"))
@@ -189,7 +191,9 @@ class RebotEmbodiment(EmbodimentBase):
             "State blocked reports -1 or +1 for the blocked joint direction; choose a pose "
             "that moves that joint back before pushing in that direction again. "
             "Joint bounds, torque caps, fresh feedback, temperature and watchdog stops apply. "
-            "No inter-arm collision model is provided. " + docs_extra,
+            "State command_rejected=1 means a proposed path crossed the tool floor. "
+            "Both arms hold; choose a different pose, such as a smaller move away from the floor. "
+            "The trial remains open. No inter-arm collision model is provided. " + docs_extra,
         )
 
     def reset(self, scene: Scene, *, seed: int | None = None) -> Observation:
@@ -267,6 +271,7 @@ class RebotEmbodiment(EmbodimentBase):
             "joint_pos": np.array(joints),
             "eef_state": np.array(poses),
             "blocked": np.array([getattr(s, "blocked", [0.0] * 6) for s in self.sessions]),
+            "command_rejected": np.array([float(self._command_rejected)]),
         }
         if self._report_effort:
             state["joint_eff"] = np.array(efforts)
@@ -282,6 +287,7 @@ class RebotEmbodiment(EmbodimentBase):
     def step(self, action: Action) -> StepResult:
         """Resolve both targets before command submission and report executed targets."""
         started = time.monotonic()
+        self._command_rejected = False
         try:
             values = np.asarray(action.data, dtype=float)
             if values.shape != (14,) or not np.isfinite(values).all() or len(self.sessions) != 2:
@@ -313,7 +319,22 @@ class RebotEmbodiment(EmbodimentBase):
             for session, target, row, kin in zip(
                 self.sessions, targets, diagnostics, self.kinematics, strict=True
             ):
-                command = session.set_position(target, validate=kin.validate_path)
+                try:
+                    command = session.set_position(target, validate=kin.validate_path)
+                except PathRejected as error:
+                    for arm in self.sessions:
+                        arm.hold()
+                    self._command_rejected = True
+                    time.sleep(max(0, 0.1 - (time.monotonic() - started)))
+                    return StepResult(
+                        observation=self.observe(),
+                        info={
+                            "command_rejected": True,
+                            "reason": str(error),
+                            "side": row["side"],
+                            "arms": diagnostics,
+                        },
+                    )
                 commands.append(list(command))
                 row["command_resynced"] = bool(getattr(session, "command_resynced", False))
                 row["requested_motor_rad"] = list(target)

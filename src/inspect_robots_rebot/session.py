@@ -65,6 +65,7 @@ class StreamingSession(native.ArmSession):
         self.motor_temp_limit = motor_temp_limit
         self.pair_stop = pair_stop or threading.Event()
         self._streaming = False
+        self._disable_on_feedback_loss = True
         self._parking = False
         self.shutdown_errors: list[str] = []
         self.shutdown_report: dict[str, Any] = {}

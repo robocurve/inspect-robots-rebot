@@ -14,6 +14,10 @@ from .config import ArmConfig
 Vec = npt.NDArray[np.float64]
 
 
+class PathRejected(ValueError):
+    """A proposed path crosses the configured tool floor."""
+
+
 def fk(joints: npt.ArrayLike) -> Vec:
     """Return the gripper-end transform in the arm base frame."""
     q = np.asarray(joints, dtype=np.float64)
@@ -129,6 +133,6 @@ class Kinematics:
         start_q, target_q = np.asarray(start)[:6], np.asarray(target)[:6]
         for fraction in np.linspace(0, 1, 31):
             if fk(start_q + fraction * (target_q - start_q))[2, 3] < self.tool_floor_m:
-                raise ValueError(
+                raise PathRejected(
                     f"Commanded joint segment crosses the {self.tool_floor_m:g} m tool floor"
                 )

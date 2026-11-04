@@ -131,3 +131,23 @@ class MotorLogTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_stale_snapshot_keeps_raw_evidence_but_not_live_temperature(tmp_path):
+    class Snapshot:
+        def get_state_snapshot(self):
+            return SimpleNamespace(state=reply(), feedback_age_s=0.481, feedback_sequence=17)
+
+    path = tmp_path / "stale.jsonl"
+    log = MotorLog(path, JOINTS[:1], source="test")
+    log.sample([Snapshot()], measured=[0.1], command=[0.1])
+    log.close()
+    output = next(
+        json.loads(line)
+        for line in path.read_text().splitlines()
+        if json.loads(line)["status"] == "actuator-output"
+    )
+    assert output["feedback"]["joint2"] == {"age_s": 0.481, "sequence": 17, "fresh": False}
+    assert output["motors"]["joint2"]["t_mos"] == 40
+    assert output["thermal"]["joint2"]["measured_c"] is None
+    assert output["thermal"]["joint2"]["feedback_fresh"] is False
