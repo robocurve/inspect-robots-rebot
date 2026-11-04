@@ -29,8 +29,10 @@ class StreamingSession(native.ArmSession):
         self,
         *args: Any,
         motor_temp_limit: float = 80.0,
+        feedback_recovery_timeout_s: float = 5.0,
         rs00_mos_temp_limit: float | None = None,
         pair_stop: threading.Event | None = None,
+        pair_feedback_stop: threading.Event | None = None,
         joint2_upper_tolerance_rad: float = native.BOUNDS_TOLERANCE,
         command_mode: str = "measured",
         command_step_rad: float = 0.2,
@@ -63,7 +65,18 @@ class StreamingSession(native.ArmSession):
             raise ValueError("rs00_mos_temp_limit must be in (0, 100] C")
         self.rs00_mos_temp_limit = mos_limit
         self.motor_temp_limit = motor_temp_limit
+        if (
+            not math.isfinite(feedback_recovery_timeout_s)
+            or not 0 < feedback_recovery_timeout_s <= 5
+        ):
+            raise ValueError("feedback_recovery_timeout_s must be in (0, 5] seconds")
+        self.feedback_recovery_timeout_s = feedback_recovery_timeout_s
+        self._disable_attempted = False
         self.pair_stop = pair_stop or threading.Event()
+        self.pair_feedback_stop = pair_feedback_stop or threading.Event()
+        self.feedback_loss_at: float | None = None
+        self._last_good_positions: tuple[float, ...] | None = None
+        self._recovery_deadline: float | None = None
         self._streaming = False
         self._disable_on_feedback_loss = True
         self._parking = False
@@ -90,10 +103,10 @@ class StreamingSession(native.ArmSession):
             raise
         return self
 
-    def feedback(self) -> Feedback:
+    def feedback(self, *, ignore_failure: bool = False) -> Feedback:
         """Read current cached replies. Never wait for a new full polling round."""
         with self._condition:
-            if self._failure is not None:
+            if self._failure is not None and not ignore_failure:
                 raise RuntimeError(f"Session faulted: {self._failure}") from self._failure
             if len(self._motors) != len(self.joints):
                 raise RuntimeError("Session is not open")
@@ -146,6 +159,8 @@ class StreamingSession(native.ArmSession):
                     raise native._EnvelopeError("Motor torque exceeded its cap for one second")
             else:
                 self._over_cap_since = None
+            if not ignore_failure:
+                self._last_good_positions = tuple(positions)
             return Feedback(tuple(positions), tuple(efforts), tuple(temperatures), now - max(ages))
 
     def activate(self) -> None:
@@ -173,6 +188,9 @@ class StreamingSession(native.ArmSession):
                     )
                 time.sleep(0.005)
             self.feedback()
+        self._disable_attempted = False
+        self.shutdown_report = {}
+        self.shutdown_errors = []
         super().activate()
 
     def observe(self) -> tuple[float, ...]:
@@ -275,6 +293,8 @@ class StreamingSession(native.ArmSession):
         if self._failure is not None:
             return
         try:
+            if self.pair_feedback_stop.is_set():
+                raise native._FeedbackError("The other arm lost feedback")
             if self.pair_stop.is_set() and not self._parking:
                 raise native._EnvelopeError("The other arm stopped")
             sample = self.feedback()
@@ -291,6 +311,11 @@ class StreamingSession(native.ArmSession):
                         f"limit={envelope:.3f} rad"
                     )
             self._relieve_stalls(sample)
+        except native._FeedbackError:
+            self.feedback_loss_at = self.feedback_loss_at or time.monotonic()
+            self.pair_feedback_stop.set()
+            self.pair_stop.set()
+            raise
         except native._EnvelopeError:
             self.pair_stop.set()
             raise
@@ -302,27 +327,37 @@ class StreamingSession(native.ArmSession):
 
     def _latch(self, reason: str, details: dict[str, Any] | None = None) -> None:
         self.pair_stop.set()
+        if reason == "arm feedback lost":
+            self.feedback_loss_at = self.feedback_loss_at or time.monotonic()
+            self.pair_feedback_stop.set()
         super()._latch(reason, details)
 
     def _disable(self) -> None:
-        if not self._activation_attempted and not self._enabled:
+        """Retry unconfirmed disable commands within one recovery window; never enable."""
+        if self._disable_attempted or (not self._activation_attempted and not self._enabled):
             return
+        self._disable_attempted = True
         self._enabled = False
-        pending = []
-        for axis, motor in zip(self.joints, self._motors, strict=True):
-            try:
-                before = motor.get_state_snapshot()
-                sequence = -1 if before is None else before.feedback_sequence
-                motor.disable()
-                pending.append((axis, motor, sequence))
-            except Exception as error:
-                self.shutdown_errors.append(f"{axis['name']} disable: {error}")
-        deadline = time.monotonic() + 0.3
-        replies = []
-        while pending:
+        started = time.monotonic()
+        deadline = started + self.feedback_recovery_timeout_s
+        if self._recovery_deadline is not None:
+            deadline = min(deadline, self._recovery_deadline)
+        pending = list(zip(self.joints, self._motors, strict=True))
+        replies: list[dict[str, Any]] = []
+        attempts: dict[str, int] = {}
+        last_errors: dict[str, str] = {}
+        while pending and time.monotonic() < deadline:
             remaining = []
-            for axis, motor, sequence in pending:
+            for axis, motor in pending:
+                name = axis["name"]
+                if time.monotonic() >= deadline:
+                    remaining.append((axis, motor))
+                    continue
+                attempts[name] = attempts.get(name, 0) + 1
                 try:
+                    before = motor.get_state_snapshot()
+                    sequence = -1 if before is None else before.feedback_sequence
+                    motor.disable()
                     sample = motor.get_state_snapshot()
                     if (
                         sample is None
@@ -331,27 +366,111 @@ class StreamingSession(native.ArmSession):
                         or ((sample.state.arbitration_id >> 22) & 3) != 0
                         or sample.state.status_code
                     ):
-                        remaining.append((axis, motor, sequence))
-                    else:
-                        replies.append(
-                            {"motor_id": axis["motor_id"], "mode": 0, "position": sample.state.pos}
-                        )
+                        raise RuntimeError("disable not confirmed")
+                    replies.append(
+                        {
+                            "motor_id": axis["motor_id"],
+                            "mode": 0,
+                            "position": sample.state.pos,
+                            "feedback_sequence": sample.feedback_sequence,
+                            "feedback_age_s": sample.feedback_age_s,
+                        }
+                    )
                 except Exception as error:
-                    self.shutdown_errors.append(f"{axis['name']} disable feedback: {error}")
+                    last_errors[name] = str(error)
+                    remaining.append((axis, motor))
             pending = remaining
-            if time.monotonic() >= deadline:
-                self.shutdown_errors.extend(
-                    f"{axis['name']}: disable not confirmed" for axis, _, _ in pending
-                )
-                break
             if pending:
-                time.sleep(0.005)
+                time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+        self.shutdown_errors.extend(
+            f"{axis['name']} disable: {last_errors.get(axis['name'], 'recovery deadline reached')}"
+            for axis, _ in pending
+        )
         self.shutdown_report = {
             "replies": replies,
             "errors": list(self.shutdown_errors),
             "home": self._home,
             "disable_confirmed": not self.shutdown_errors and len(replies) == len(self._motors),
+            "recovery_timeout_s": self.feedback_recovery_timeout_s,
+            "disable_elapsed_s": time.monotonic() - started,
+            "disable_attempts": attempts,
+            "retry_errors": last_errors,
         }
+
+    def prepare_feedback_recovery(self, deadline: float) -> tuple[Feedback, dict[str, Any]]:
+        """Stop the loop and confirm fresh disabled state; do not clear or enable."""
+        self._recovery_deadline = deadline
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(0.0, deadline - time.monotonic()))
+            if self._thread.is_alive():
+                raise RuntimeError("Recovery control thread did not stop")
+        with self._condition:
+            self._disable()
+            if not self.shutdown_report.get("disable_confirmed"):
+                raise RuntimeError("Recovery requires confirmed disable")
+            if self._failure is not None and not isinstance(self._failure, native._FeedbackError):
+                raise RuntimeError("Recovery refused for a non-feedback fault")
+            if self._last_good_positions is None or self._ledger is None:
+                raise RuntimeError("Recovery has no valid pose reference")
+            ledger = self._ledger.snapshot()
+            if ledger["stopped"] and ledger["reason"] not in (
+                "arm feedback lost",
+                "paired feedback recovery",
+            ):
+                raise RuntimeError("Recovery refused for another stop record")
+            for motor in self._motors:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("Feedback recovery timed out")
+                before = motor.get_state_snapshot()
+                motor.disable()
+                after = motor.get_state_snapshot()
+                if (
+                    before is None
+                    or after is None
+                    or after.feedback_sequence <= before.feedback_sequence
+                    or not 0 <= after.feedback_age_s <= 0.1
+                    or ((after.state.arbitration_id >> 22) & 3) != 0
+                ):
+                    raise RuntimeError("Fresh disabled replies are required for recovery")
+                fault, warning = motor.robstride_get_fault_report()
+                if fault or warning:
+                    raise RuntimeError("Motor fault or warning prevents recovery")
+            sample = self.feedback(ignore_failure=True)
+            for i, (before, after) in enumerate(
+                zip(self._last_good_positions, sample.positions, strict=True)
+            ):
+                if abs(after - before) > (0.05 if i < 6 else 0.3):
+                    raise RuntimeError("Pose changed too far during feedback recovery")
+            if self._ledger.snapshot() != ledger:
+                raise RuntimeError("Stop evidence changed during recovery")
+            return sample, ledger
+
+    def accept_feedback_recovery(self, sample: Feedback, ledger: dict[str, Any]) -> None:
+        """Acknowledge only the checked stop; prepare to enable at the measured pose."""
+        with self._condition:
+            if self._ledger is None or self._ledger.snapshot() != ledger:
+                raise RuntimeError("Stop evidence changed before recovery acknowledgement")
+            self._log("feedback-recovery-ready", positions_rad=sample.positions, prior_stop=ledger)
+            self._ledger.acknowledge(
+                details={"feedback_recovery": True, "positions_rad": sample.positions}
+            )
+            self._failure = None
+            self._lost_control = False
+            self._path = self._goal = None
+            self._path_error = None
+            self._positions = sample.positions
+            self._command = list(sample.positions)
+            self._last_good_positions = sample.positions
+            self._streaming = False
+            self._stop.clear()
+            self._thread = None
+            self._recovery_deadline = None
+            self.feedback_loss_at = None
+            self.blocked = [0.0] * 6
+            self._stall_progress = [None] * 6
+            self._ff_scale = 0.0
+            self._ff_target = 1.0
 
     def close(self) -> None:
         """Park, verify disable replies, and release all resources even after an error."""

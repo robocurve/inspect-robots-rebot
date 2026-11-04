@@ -214,3 +214,30 @@ Motor logs include per-motor feedback age, sequence, and freshness. A stale
 snapshot remains in the raw evidence, but its temperature is not reported as a
 current `measured_c` value. Drivers without snapshot support report unknown
 freshness. The streaming adapter still requires snapshot support.
+
+### Optional recovery within a trial
+
+Set `recover_feedback_in_trial=true` and `feedback_recovery_timeout_s=5` to
+recover eligible feedback interruptions without ending the trial. The default
+is off. This does not accept five-second-old position or temperature readings.
+The motion feedback limit remains 0.1 seconds.
+
+A feedback interruption stops target progression and requests disable on both
+arms. A background worker also handles interruptions during model inference.
+Only unconfirmed motors receive disable retries. The recovery window starts at
+the feedback fault and includes the disable and verification work. No new
+recovery command starts after its deadline; an in-flight driver call can finish
+after the deadline. Motor-driver timeouts remain in effect.
+
+Re-enable requires fresh disabled replies, no fault or warning, unchanged stop
+evidence, a fresh camera frame, and a tool position above the configured floor.
+Each arm joint must remain within 0.05 rad of its last valid position; the gripper
+allowance is 0.3 rad. Re-enable starts from measured positions and keeps the
+original home pose and Cartesian orientation reference. An interrupted step is
+discarded. `feedback_recoveries` reports the recovery count to the policy.
+
+A trial permits at most three recoveries. A failed check, missing reply, expired
+window, other fault, or exhausted recovery budget leaves the arms stopped.
+Recovery does not acknowledge an unrelated stop record. Close cancels recovery
+before re-enable and preserves disable errors. Disabled arms can move under
+load, so some poses will correctly refuse automatic recovery.

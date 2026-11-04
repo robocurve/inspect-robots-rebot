@@ -26,6 +26,8 @@ from inspect_robots import (
 )
 from inspect_robots.errors import EmbodimentFault
 
+from inspect_robots_b601.hardware import session as native
+
 from .config import load_arm
 from .kinematics import Kinematics, PathRejected
 from .session import StreamingSession
@@ -53,6 +55,8 @@ class RebotEmbodiment(EmbodimentBase):
         camera_url: str = "",
         allow_motion: bool = False,
         motor_temp_limit: float = 80,
+        feedback_recovery_timeout_s: float = 5.0,
+        recover_feedback_in_trial: bool = False,
         rs00_mos_temp_limit: float | None = None,
         tool_floor_m: float = 0.12,
         wrist_yaw_command_margin_rad: float = 0.0,
@@ -80,6 +84,16 @@ class RebotEmbodiment(EmbodimentBase):
             raise ValueError("Command limits must be finite and positive")
         if command_step_rad + command_resync_rad >= 0.6:
             raise ValueError("Command limits must leave room inside the native fault envelope")
+        if not np.isfinite(feedback_recovery_timeout_s) or not 0 < feedback_recovery_timeout_s <= 5:
+            raise ValueError("feedback_recovery_timeout_s must be in (0, 5] seconds")
+        self.feedback_recovery_timeout_s = feedback_recovery_timeout_s
+        self.recover_feedback_in_trial = recover_feedback_in_trial
+        self._recovering_feedback = False
+        self._feedback_recoveries = 0
+        self._operation_lock = threading.RLock()
+        self._recovery_stop = threading.Event()
+        self._recovery_thread: threading.Thread | None = None
+        self._recovery_error: BaseException | None = None
         self.command_options: dict[str, Any] = {
             "command_mode": command_mode,
             "command_step_rad": command_step_rad,
@@ -156,6 +170,7 @@ class RebotEmbodiment(EmbodimentBase):
             StateField("eef_state", (14,), "m+rad+normalized"),
             StateField("blocked", (2, 6), "direction"),
             StateField("command_rejected", (1,), "boolean"),
+            StateField("feedback_recoveries", (1,), "count"),
         ]
         if report_joint_eff:
             fields.append(StateField("joint_eff", (2, 7), "Nm"))
@@ -193,7 +208,11 @@ class RebotEmbodiment(EmbodimentBase):
             "Joint bounds, torque caps, fresh feedback, temperature and watchdog stops apply. "
             "State command_rejected=1 means a proposed path crossed the tool floor. "
             "Both arms hold; choose a different pose, such as a smaller move away from the floor. "
-            "The trial remains open. No inter-arm collision model is provided. " + docs_extra,
+            "The trial remains open. With in-trial feedback recovery enabled, a brief feedback "
+            "loss pauses motion and disables both arms. Re-enable requires fresh disabled replies, "
+            "no faults, and less than 0.05 rad arm-joint drift within the recovery window. "
+            "State feedback_recoveries counts these pauses. Read the new pose before replanning. "
+            "No inter-arm collision model is provided. " + docs_extra,
         )
 
     def reset(self, scene: Scene, *, seed: int | None = None) -> Observation:
@@ -205,6 +224,8 @@ class RebotEmbodiment(EmbodimentBase):
         self.shutdown_reports = []
         self.instruction = scene.instruction
         pair_stop = threading.Event()
+        pair_feedback_stop = threading.Event()
+        self._feedback_recoveries = 0
         try:
             if self._camera_factory is None:
                 from .camera import LiveCamera
@@ -227,9 +248,11 @@ class RebotEmbodiment(EmbodimentBase):
                     config.profile,
                     config.state_dir,
                     home_wait=240,
+                    feedback_recovery_timeout_s=self.feedback_recovery_timeout_s,
                     motor_temp_limit=self.motor_temp_limit,
                     rs00_mos_temp_limit=self.rs00_mos_temp_limit,
                     pair_stop=pair_stop,
+                    pair_feedback_stop=pair_feedback_stop,
                     joint2_upper_tolerance_rad=self.joint2_upper_tolerance_rad,
                     **self.command_options,
                 )
@@ -243,7 +266,15 @@ class RebotEmbodiment(EmbodimentBase):
                 kin.capture_reference(q[:6])
             self._init_pose = np.concatenate(positions)
             self._driver = self
-            return self.observe()
+            observation = self.observe()
+            self._recovery_error = None
+            self._recovery_stop.clear()
+            if self.recover_feedback_in_trial:
+                self._recovery_thread = threading.Thread(
+                    target=self._watch_feedback, name="rebot-feedback-recovery", daemon=True
+                )
+                self._recovery_thread.start()
+            return observation
         except BaseException as primary:
             try:
                 self.close()
@@ -253,7 +284,95 @@ class RebotEmbodiment(EmbodimentBase):
                 ) from primary
             raise
 
+    def _watch_feedback(self) -> None:
+        while not self._recovery_stop.wait(0.02):
+            if not self._operation_lock.acquire(timeout=0.05):
+                continue
+            try:
+                if self._recovery_stop.is_set():
+                    return
+                if any(s.pair_feedback_stop.is_set() for s in self.sessions):
+                    self._recover_feedback(native._FeedbackError("Feedback interruption"))
+            except BaseException as error:
+                self._recovery_error = error
+                return
+            finally:
+                self._operation_lock.release()
+
     def observe(self) -> Observation:
+        """Recover an eligible interruption before returning a fresh observation."""
+        with self._operation_lock:
+            if self._recovery_error is not None:
+                raise EmbodimentFault(f"Feedback recovery failed: {self._recovery_error}")
+            try:
+                return self._observe_once()
+            except Exception as error:
+                if self._recover_feedback(error):
+                    return self._observe_once()
+                raise
+
+    def _recover_feedback(self, error: BaseException) -> bool:
+        if (
+            not self.recover_feedback_in_trial
+            or self._recovering_feedback
+            or self._recovery_error is not None
+            or len(self.sessions) != 2
+        ):
+            return False
+        eligible = isinstance(error, native._FeedbackError) or any(
+            isinstance(getattr(s, "_failure", None), native._FeedbackError) for s in self.sessions
+        )
+        if not eligible:
+            return False
+        if self._feedback_recoveries >= 3:
+            raise RuntimeError("Feedback recovery budget exhausted") from error
+        self._recovering_feedback = True
+        losses = [s.feedback_loss_at for s in self.sessions if s.feedback_loss_at is not None]
+        deadline = (min(losses) if losses else time.monotonic()) + self.feedback_recovery_timeout_s
+        try:
+            for s in self.sessions:
+                s.pair_feedback_stop.set()
+                s.pair_stop.set()
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = [
+                    pool.submit(s.prepare_feedback_recovery, deadline) for s in self.sessions
+                ]
+                prepared = [future.result() for future in futures]
+            if self._camera is None:
+                raise RuntimeError("Camera missing during recovery")
+            self._camera.get()
+            for kin, (sample, _) in zip(self.kinematics, prepared, strict=True):
+                kin.validate_path(sample.positions, sample.positions)
+            if time.monotonic() >= deadline:
+                raise RuntimeError("Feedback recovery timed out")
+            for session, (sample, ledger) in zip(self.sessions, prepared, strict=True):
+                session.accept_feedback_recovery(sample, ledger)
+            for s in self.sessions:
+                s.pair_feedback_stop.clear()
+                s.pair_stop.clear()
+            for s in self.sessions:
+                if self._recovery_stop.is_set() or time.monotonic() >= deadline:
+                    raise RuntimeError("Feedback recovery stopped before enable")
+                s.activate()
+            self._feedback_recoveries += 1
+            for s in self.sessions:
+                s._log("feedback-recovered", count=self._feedback_recoveries)
+            return True
+        except BaseException as recovery_error:
+            # No home motion if a recovery check fails.
+            for s in self.sessions:
+                s._stop.set()
+            for s in self.sessions:
+                if s._thread is not None:
+                    s._thread.join(timeout=2)
+                with s._condition:
+                    s._disable()
+                    s._latch("feedback recovery failed", {"error": str(recovery_error)})
+            raise
+        finally:
+            self._recovering_feedback = False
+
+    def _observe_once(self) -> Observation:
         """Return measured arm state and the latest fresh overhead frame."""
         if len(self.sessions) != 2 or self._camera is None:
             raise EmbodimentFault("Both arms and the camera must be open")
@@ -272,6 +391,7 @@ class RebotEmbodiment(EmbodimentBase):
             "eef_state": np.array(poses),
             "blocked": np.array([getattr(s, "blocked", [0.0] * 6) for s in self.sessions]),
             "command_rejected": np.array([float(self._command_rejected)]),
+            "feedback_recoveries": np.array([float(self._feedback_recoveries)]),
         }
         if self._report_effort:
             state["joint_eff"] = np.array(efforts)
@@ -285,10 +405,17 @@ class RebotEmbodiment(EmbodimentBase):
         )
 
     def step(self, action: Action) -> StepResult:
+        """Serialize commands with feedback recovery."""
+        with self._operation_lock:
+            return self._step_once(action)
+
+    def _step_once(self, action: Action) -> StepResult:
         """Resolve both targets before command submission and report executed targets."""
         started = time.monotonic()
         self._command_rejected = False
         try:
+            if self._recovery_error is not None:
+                raise EmbodimentFault(f"Feedback recovery failed: {self._recovery_error}")
             values = np.asarray(action.data, dtype=float)
             if values.shape != (14,) or not np.isfinite(values).all() or len(self.sessions) != 2:
                 raise EmbodimentFault(
@@ -349,6 +476,14 @@ class RebotEmbodiment(EmbodimentBase):
                 },
             )
         except BaseException as primary:
+            try:
+                if self._recover_feedback(primary):
+                    return StepResult(
+                        observation=self._observe_once(),
+                        info={"feedback_recovered": True, "command_discarded": True},
+                    )
+            except BaseException as recovery_error:
+                primary = recovery_error
             for session in self.sessions:
                 with contextlib.suppress(Exception):
                     session.hold()
@@ -358,10 +493,16 @@ class RebotEmbodiment(EmbodimentBase):
                 raise EmbodimentFault(
                     f"Step failed: {primary}; shutdown failed: {cleanup}"
                 ) from primary
-            raise
+            raise primary
 
     def close(self) -> None:
         """Park and close both arms independently, then close the camera."""
+        self._recovery_stop.set()
+        if self._recovery_thread is not None:
+            self._recovery_thread.join(timeout=self.feedback_recovery_timeout_s + 2)
+            if self._recovery_thread.is_alive():
+                raise EmbodimentFault("Feedback recovery thread did not stop")
+            self._recovery_thread = None
         sessions, self.sessions = self.sessions, []
         errors = []
         if sessions:

@@ -58,6 +58,7 @@ def session(config):
         controller_factory=lambda _: controller,
         bus_factory=lambda _: Dummy(),
         home_wait=0,
+        feedback_recovery_timeout_s=0.05,
     )
     s.open()
     yield s
@@ -215,6 +216,7 @@ def test_disable_failure_closes_resources(config):
         controller_factory=lambda _: controller,
         bus_factory=lambda _: bus,
         home_wait=0,
+        feedback_recovery_timeout_s=0.05,
     )
     s.open()
     s.activate()
@@ -808,3 +810,135 @@ def test_short_feedback_age_does_not_stop_stream(session):
     time.sleep(0.12)
     assert session._enabled and session._failure is None
     session._motors[0].age = 0
+
+
+class RecoverableMotor(SnapshotMotor):
+    """A delayed motor that returns fresh replies after disable."""
+
+    def __init__(self, position):
+        super().__init__(position)
+        self.enable_count = 0
+        self.shift_on_disable = 0.0
+
+    def enable(self):
+        self.enable_count += 1
+        super().enable()
+
+    def disable(self):
+        if self.age > 0.1:
+            self.position += self.shift_on_disable
+        super().disable()
+        self.age = 0
+
+
+def recovery_pair(tmp_path, timeout=5):
+    controllers = []
+
+    def factory(profile, state_dir, **kwargs):
+        c = FakeController()
+        c.motors = [RecoverableMotor(p) for p in [-0.1, 0.15, 0.2, 0.05, -0.2, 0.1, 0]]
+        controllers.append(c)
+        StopLedger(state_dir).acknowledge()
+        return StreamingSession(
+            profile,
+            state_dir,
+            controller_factory=lambda _: c,
+            bus_factory=lambda _: Dummy(),
+            **kwargs,
+        )
+
+    e = RebotEmbodiment(
+        allow_motion=True,
+        state_dir=str(tmp_path),
+        session_factory=factory,
+        camera_factory=Camera,
+        recover_feedback_in_trial=True,
+        feedback_recovery_timeout_s=timeout,
+    )
+    e.reset(Scene(id="recovery", instruction="continue after a brief delay"))
+    return e, controllers
+
+
+def test_113ms_recovers_during_model_inference_without_ending_trial(tmp_path):
+    e, controllers = recovery_pair(tmp_path)
+    sessions = list(e.sessions)
+    kinematics = list(e.kinematics)
+    homes = [s._home for s in sessions]
+    try:
+        controllers[0].motors[0].age = 0.113
+        deadline = time.monotonic() + 3
+        while (
+            e._feedback_recoveries == 0
+            and e._recovery_error is None
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        assert e._recovery_error is None
+        assert e._feedback_recoveries == 1
+        assert e.sessions == sessions and e.kinematics == kinematics
+        assert [s._home for s in sessions] == homes
+        assert all(m.enabled and m.enable_count == 2 for c in controllers for m in c.motors)
+        observation = e.observe()
+        result = e.step(Action(observation.state["eef_state"].copy()))
+        assert result.observation.state["feedback_recoveries"].tolist() == [1]
+    finally:
+        e.close()
+    assert all(r["disable_confirmed"] for r in e.shutdown_reports)
+
+
+@pytest.mark.parametrize("problem", ["pose", "disconnect", "fault"])
+def test_failed_feedback_recovery_never_reenables(tmp_path, problem):
+    e, controllers = recovery_pair(tmp_path, timeout=0.3)
+    motor = controllers[0].motors[0]
+    if problem == "pose":
+        motor.shift_on_disable = 0.2
+    if problem == "disconnect":
+        motor.disable_fails = True
+    if problem == "fault":
+        motor.fault = 1
+    motor.age = 0.113
+    deadline = time.monotonic() + 2
+    while e._recovery_error is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert e._recovery_error is not None
+    assert e._feedback_recoveries == 0
+    assert all(m.enable_count == 1 for c in controllers for m in c.motors)
+    with pytest.raises(EmbodimentFault, match="Feedback recovery failed"):
+        e.observe()
+    if problem == "disconnect":
+        with pytest.raises(EmbodimentFault):
+            e.close()
+    else:
+        e.close()
+
+
+def test_feedback_can_return_after_four_seconds_without_new_trial(tmp_path):
+    e, controllers = recovery_pair(tmp_path)
+    motor = controllers[0].motors[0]
+    original = motor.disable
+    ready_at = time.monotonic() + 4
+
+    def delayed_disable():
+        if time.monotonic() < ready_at:
+            raise OSError("simulated delayed reply")
+        original()
+
+    motor.disable = delayed_disable
+    try:
+        motor.age = 0.113
+        deadline = time.monotonic() + 6
+        while (
+            not e._feedback_recoveries and e._recovery_error is None and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        assert e._recovery_error is None
+        assert e._feedback_recoveries == 1
+        assert all(m.enabled for c in controllers for m in c.motors)
+    finally:
+        e.close()
+
+
+@pytest.mark.parametrize("timeout", [0, -1, 5.01, float("nan"), float("inf")])
+def test_invalid_feedback_recovery_window(timeout):
+    with pytest.raises(ValueError, match="feedback_recovery_timeout_s"):
+        RebotEmbodiment(feedback_recovery_timeout_s=timeout)
