@@ -54,6 +54,9 @@ class RebotEmbodiment(EmbodimentBase):
         allow_motion: bool = False,
         motor_temp_limit: float = 80,
         tool_floor_m: float = 0.12,
+        command_mode: str = "measured",
+        command_step_rad: float = 0.2,
+        command_resync_rad: float = 0.35,
         control_interface: str = "eef_pos",
         report_joint_eff: bool = True,
         docs_extra: str = "",
@@ -68,6 +71,17 @@ class RebotEmbodiment(EmbodimentBase):
             raise ValueError("motor_temp_limit must be in (0, 80] C")
         if not np.isfinite(tool_floor_m) or tool_floor_m >= 0.6:
             raise ValueError("tool_floor_m must be finite and below the 0.6 m upper bound")
+        if command_mode not in ("measured", "previous"):
+            raise ValueError("command_mode must be measured or previous")
+        if not all(np.isfinite(v) and v > 0 for v in (command_step_rad, command_resync_rad)):
+            raise ValueError("Command limits must be finite and positive")
+        if command_step_rad + command_resync_rad >= 0.6:
+            raise ValueError("Command limits must leave room inside the native fault envelope")
+        self.command_options: dict[str, Any] = {
+            "command_mode": command_mode,
+            "command_step_rad": command_step_rad,
+            "command_resync_rad": command_resync_rad,
+        }
         self.tool_floor_m = float(tool_floor_m)
         self.configs = [
             load_arm(
@@ -179,6 +193,7 @@ class RebotEmbodiment(EmbodimentBase):
                     home_wait=240,
                     motor_temp_limit=self.motor_temp_limit,
                     pair_stop=pair_stop,
+                    **self.command_options,
                 )
                 self.sessions.append(session)
                 session.open()
@@ -235,7 +250,8 @@ class RebotEmbodiment(EmbodimentBase):
                 raise EmbodimentFault(
                     "A paired action requires 14 finite values and two active arms"
                 )
-            targets, diagnostics = [], []
+            targets: list[list[float]] = []
+            diagnostics: list[dict[str, Any]] = []
             for i, (session, config, kin) in enumerate(
                 zip(self.sessions, self.configs, self.kinematics, strict=True)
             ):
@@ -261,6 +277,8 @@ class RebotEmbodiment(EmbodimentBase):
             ):
                 command = session.set_position(target, validate=kin.validate_path)
                 commands.append(list(command))
+                row["command_resynced"] = bool(getattr(session, "command_resynced", False))
+                row["requested_motor_rad"] = list(target)
                 row["tracking_limited"] = not np.allclose(command, target, atol=1e-9, rtol=0)
             time.sleep(max(0, 0.1 - (time.monotonic() - started)))
             return StepResult(

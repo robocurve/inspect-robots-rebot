@@ -561,3 +561,54 @@ def test_path_uses_configured_floor(config, monkeypatch):
     height[0] = -0.021
     with pytest.raises(ValueError, match=r"-0\.02 m"):
         relaxed.validate_path([0] * 6, [0.01] * 6)
+
+
+def test_previous_command_steps_and_whole_arm_resync(session):
+    session.activate()
+    session._stop.set()
+    session._thread.join(1)
+    session.command_mode = "previous"
+    target = [0.8] * 6 + [1.0]
+    assert session.set_position(target)[:6] == pytest.approx([0.2] * 6)
+    assert session.set_position(target)[:6] == pytest.approx([0.4] * 6)
+    assert not session.command_resynced
+    # Only one joint needs to fall behind to reset all six references.
+    for motor in session._motors[:6]:
+        motor.position = 0.2
+    session._motors[0].position = 0.0
+    command = session.set_position(target)
+    assert command[:6] == pytest.approx([0.2] + [0.4] * 5)
+    assert session.command_resynced
+    assert command[6] == pytest.approx(0.44)
+    session._enabled = False
+
+
+def test_failed_path_does_not_advance_command_reference(session):
+    session.activate()
+    session._stop.set()
+    session._thread.join(1)
+    session.command_mode = "previous"
+    first = session.set_position([0.8] * 6 + [0])
+
+    def reject(start, target):
+        raise ValueError("blocked path")
+
+    with pytest.raises(ValueError, match="blocked path"):
+        session.set_position([0.8] * 6 + [0], validate=reject)
+    assert tuple(session._command) == first
+    session._enabled = False
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"command_mode": "unknown"},
+        {"command_step_rad": float("nan")},
+        {"command_step_rad": 0},
+        {"command_resync_rad": -0.1},
+        {"command_step_rad": 0.3, "command_resync_rad": 0.35},
+    ],
+)
+def test_invalid_command_configuration(tmp_path, kwargs):
+    with pytest.raises(ValueError):
+        RebotEmbodiment(state_dir=str(tmp_path), **kwargs)

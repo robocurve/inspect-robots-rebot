@@ -30,11 +30,24 @@ class StreamingSession(native.ArmSession):
         *args: Any,
         motor_temp_limit: float = 80.0,
         pair_stop: threading.Event | None = None,
+        command_mode: str = "measured",
+        command_step_rad: float = 0.2,
+        command_resync_rad: float = 0.35,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
         if not math.isfinite(motor_temp_limit) or not 0 < motor_temp_limit <= 80:
             raise ValueError("motor_temp_limit must be in (0, 80] C")
+        if command_mode not in ("measured", "previous"):
+            raise ValueError("command_mode must be measured or previous")
+        if not all(math.isfinite(v) and v > 0 for v in (command_step_rad, command_resync_rad)):
+            raise ValueError("Command limits must be finite and positive")
+        if command_step_rad + command_resync_rad >= native.MAX_EXCURSION:
+            raise ValueError("Command limits must leave room inside the native fault envelope")
+        self.command_mode = command_mode
+        self.command_step_rad = command_step_rad
+        self.command_resync_rad = command_resync_rad
+        self.command_resynced = False
         self.motor_temp_limit = motor_temp_limit
         self.pair_stop = pair_stop or threading.Event()
         self._streaming = False
@@ -146,7 +159,7 @@ class StreamingSession(native.ArmSession):
         *,
         validate: Callable[[Sequence[float], Sequence[float]], None] | None = None,
     ) -> tuple[float, ...]:
-        """Set a target inside the native command-lead allowance."""
+        """Set a bounded target using the selected command reference."""
         requested = tuple(float(v) for v in target)
         if len(requested) != len(self.joints) or not all(math.isfinite(v) for v in requested):
             raise ValueError("A position command requires one finite value per motor")
@@ -156,6 +169,16 @@ class StreamingSession(native.ArmSession):
             if self._path is not None or self._goal is not None:
                 raise RuntimeError("A native move is in progress")
             measured = self.feedback().positions
+            reference = measured
+            resynced = False
+            if self.command_mode == "previous" and self._streaming:
+                reference = tuple(self._command)
+                resynced = any(
+                    abs(a - b) > self.command_resync_rad
+                    for a, b in zip(reference[:6], measured[:6], strict=True)
+                )
+                if resynced:
+                    reference = measured
             command = []
             for i, (value, actual, low, high) in enumerate(
                 zip(requested, measured, self.lower, self.upper, strict=True)
@@ -163,9 +186,13 @@ class StreamingSession(native.ArmSession):
                 if not low <= value <= high:
                     raise ValueError("Position command exceeds joint bounds")
                 reach = self._axis_limit(i, native.HOLD_REACH, native.GRIPPER_REACH) - 0.01
-                command.append(max(low, min(high, max(actual - reach, min(actual + reach, value)))))
+                anchor = actual
+                if self.command_mode == "previous" and i < 6:
+                    anchor, reach = reference[i], self.command_step_rad
+                command.append(max(low, min(high, max(anchor - reach, min(anchor + reach, value)))))
             if validate is not None:
                 validate(measured, command)
+            self.command_resynced = resynced
             self._streaming = True
             self._command = command
             self._condition.notify_all()

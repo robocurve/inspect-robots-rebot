@@ -130,3 +130,26 @@ Before an overnight queue, test the installed package and driver together, inspe
 both-arm motion and shutdown, and complete a short live RoboComms trial. Record the
 package commit, driver build, station profiles, and trial result outside this public
 repository. Do not publish credentials, private queue data, or site addresses here.
+
+
+## Command reference comparison
+
+The default `command_mode="measured"` retains the 0.08 rad arm command
+lead relative to measured position. The optional `command_mode="previous"`
+limits each arm command change to `command_step_rad=0.2` rad from the prior
+issued command. If any of the six arm joints differs from that reference by
+more than `command_resync_rad=0.35` rad, all six references reset to measured
+position. The first command also starts from measured position. The gripper
+retains its separate measured-position allowance.
+
+These parameters follow the YAM command-step and reference-reset method.
+They do not reproduce YAM's IK solver or oscillation hold, and do not prove
+equal physical speed. Their sum must stay below the native 0.6 rad fault envelope.
+Joint position bounds and feedback checks remain active. Rejected paths do
+not advance the issued-command reference. Step records include requested and
+issued motor targets, command limiting, reference resets, and elapsed time.
+
+The previous-command option has software tests only. It is not a
+hardware-qualified setting. Resolve boundary overshoot before speed
+qualification. Compare equivalent interior-workspace trajectories and measure
+actual movement time separately from model inference time.
