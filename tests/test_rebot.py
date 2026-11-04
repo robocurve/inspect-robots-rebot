@@ -831,7 +831,7 @@ class RecoverableMotor(SnapshotMotor):
         self.age = 0
 
 
-def recovery_pair(tmp_path, timeout=5):
+def recovery_pair(tmp_path, timeout=5, active_arms="both"):
     controllers = []
 
     def factory(profile, state_dir, **kwargs):
@@ -852,6 +852,7 @@ def recovery_pair(tmp_path, timeout=5):
         state_dir=str(tmp_path),
         session_factory=factory,
         camera_factory=Camera,
+        active_arms=active_arms,
         recover_feedback_in_trial=True,
         feedback_recovery_timeout_s=timeout,
     )
@@ -1084,5 +1085,61 @@ def test_disabled_settling_larger_than_old_drift_limit_recovers(tmp_path):
             time.sleep(0.01)
         assert e._recovery_error is None
         assert e._feedback_recoveries == 1
+    finally:
+        e.close()
+
+
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_single_arm_uses_only_selected_bus_and_seven_actions(tmp_path, side):
+    opened = []
+
+    def factory(profile, state_dir, **kwargs):
+        opened.append((profile["channel"], state_dir))
+        return Arm(profile, state_dir, **kwargs)
+
+    inactive = "left" if side == "right" else "right"
+    e = RebotEmbodiment(
+        active_arms=side,
+        allow_motion=True,
+        state_dir=str(tmp_path),
+        session_factory=factory,
+        camera_factory=Camera,
+        **{inactive + "_profile": "/missing/inactive/profile.json"},
+    )
+    try:
+        observation = e.reset(Scene(id="single", instruction="use the selected arm"))
+        assert len(opened) == 1
+        assert opened[0][0] == ("can0" if side == "right" else "can1")
+        assert not (tmp_path / inactive).exists()
+        assert e.info.action_space.shape == (7,)
+        assert e.info.action_space.semantics.dim_labels[0] == side + "_x"
+        assert observation.state["joint_pos"].shape == (1, 7)
+        target = observation.state["eef_state"].copy()
+        target[2] += 0.005
+        result = e.step(Action(target))
+        assert result.info["arms"][0]["side"] == side
+        assert result.observation.state["eef_state"].shape == (7,)
+    finally:
+        e.close()
+    assert len(e.shutdown_reports) == 1 and e.shutdown_reports[0]["disable_confirmed"]
+
+
+def test_unknown_active_arm_is_rejected():
+    with pytest.raises(ValueError, match="active_arms"):
+        RebotEmbodiment(active_arms="unknown")
+
+
+def test_right_only_feedback_recovery(tmp_path):
+    e, controllers = recovery_pair(tmp_path, active_arms="right")
+    try:
+        assert len(controllers) == 1
+        controllers[0].motors[0].age = 0.113
+        deadline = time.monotonic() + 3
+        while (
+            not e._feedback_recoveries and e._recovery_error is None and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        assert e._recovery_error is None and e._feedback_recoveries == 1
+        assert e.observe().state["eef_state"].shape == (7,)
     finally:
         e.close()

@@ -45,6 +45,7 @@ class RebotEmbodiment(EmbodimentBase):
     def __init__(
         self,
         *,
+        active_arms: str = "both",
         left_channel: str = "can1",
         right_channel: str = "can0",
         left_profile: str = "",
@@ -72,7 +73,11 @@ class RebotEmbodiment(EmbodimentBase):
     ) -> None:
         if control_interface != "eef_pos":
             raise ValueError("rebot_arms currently supports control_interface=eef_pos")
-        if left_channel == right_channel:
+        if active_arms not in ("both", "left", "right"):
+            raise ValueError("active_arms must be both, left, or right")
+        self.sides = ("left", "right") if active_arms == "both" else (active_arms,)
+        count = len(self.sides)
+        if count == 2 and left_channel == right_channel:
             raise ValueError("Left and right arms require distinct CAN interfaces")
         if not np.isfinite(motor_temp_limit) or not 0 < motor_temp_limit <= 80:
             raise ValueError("motor_temp_limit must be in (0, 80] C")
@@ -101,17 +106,17 @@ class RebotEmbodiment(EmbodimentBase):
         }
         self.tool_floor_m = float(tool_floor_m)
         self._command_rejected = False
-        self.configs = [
-            load_arm(
-                left_profile, left_channel, Path(left_state_dir or str(Path(state_dir) / "left"))
-            ),
-            load_arm(
-                right_profile,
-                right_channel,
-                Path(right_state_dir or str(Path(state_dir) / "right")),
-            ),
-        ]
-        if self.configs[0].state_dir == self.configs[1].state_dir:
+        arm_options = {
+            "left": (left_profile, left_channel, left_state_dir),
+            "right": (right_profile, right_channel, right_state_dir),
+        }
+        self.configs = []
+        for side in self.sides:
+            profile, channel, directory = arm_options[side]
+            self.configs.append(
+                load_arm(profile, channel, Path(directory or str(Path(state_dir) / side)))
+            )
+        if len({c.state_dir for c in self.configs}) != count:
             raise ValueError("Each arm requires its own persistent stop directory")
         tolerance = joint2_upper_tolerance_rad
         if not np.isfinite(tolerance) or not 0.01 <= tolerance <= 0.012:
@@ -165,19 +170,26 @@ class RebotEmbodiment(EmbodimentBase):
             ]
         )
         self.high = np.array([0.6, 0.05, 0.6, np.pi, 0, 0, 1, 0.6, 0.4, 0.6, np.pi, 0, 0, 1])
+        indices = [
+            i
+            for side in self.sides
+            for i in range(0 if side == "left" else 7, 7 if side == "left" else 14)
+        ]
+        self.low, self.high = self.low[indices], self.high[indices]
+        labels = tuple(LABELS[i] for i in indices)
         fields = [
-            StateField("joint_pos", (2, 7), "rad+normalized"),
-            StateField("eef_state", (14,), "m+rad+normalized"),
-            StateField("blocked", (2, 6), "direction"),
+            StateField("joint_pos", (count, 7), "rad+normalized"),
+            StateField("eef_state", (7 * count,), "m+rad+normalized"),
+            StateField("blocked", (count, 6), "direction"),
             StateField("command_rejected", (1,), "boolean"),
             StateField("feedback_recoveries", (1,), "count"),
         ]
         if report_joint_eff:
-            fields.append(StateField("joint_eff", (2, 7), "Nm"))
+            fields.append(StateField("joint_eff", (count, 7), "Nm"))
         self.info = EmbodimentInfo(
             name="rebot_arms",
             action_space=Box(
-                shape=(14,),
+                shape=(7 * count,),
                 low=self.low,
                 high=self.high,
                 semantics=ActionSemantics(
@@ -185,7 +197,7 @@ class RebotEmbodiment(EmbodimentBase):
                     rotation_repr="none",
                     gripper="continuous",
                     frame="base",
-                    dim_labels=LABELS,
+                    dim_labels=labels,
                 ),
             ),
             observation_space=ObservationSpace(
@@ -194,7 +206,8 @@ class RebotEmbodiment(EmbodimentBase):
             control_hz=10,
             is_simulated=False,
             capabilities=frozenset({"self_paced"}),
-            docs="Two reBot B601-RS arms, left then right. Each target uses its own base frame: "
+            docs=f"Active reBot B601-RS arms: {', '.join(self.sides)}. "
+            "Inactive arms are not opened or controlled. Each target uses its own base frame: "
             "+x forward, +y left, +z up. XYZ values are metres at the gripper end. "
             "Yaw, pitch, roll are radians relative to the measured reset orientation. "
             "Rotation is Rz(yaw) Ry(-pitch) Rx(roll). Pitch and roll are fixed at zero. "
@@ -207,10 +220,10 @@ class RebotEmbodiment(EmbodimentBase):
             "that moves that joint back before pushing in that direction again. "
             "Joint bounds, torque caps, fresh feedback, temperature and watchdog stops apply. "
             "State command_rejected=1 means a proposed path crossed the tool floor. "
-            "Both arms hold; choose a different pose, such as a smaller move away from the floor. "
+            "Active arms hold; choose a different pose away from the floor. "
             "The trial remains open. With in-trial feedback recovery enabled, a brief feedback "
-            "loss pauses motion and disables both arms. Re-enable requires fresh disabled replies, "
-            "no faults, and less than 0.05 rad arm-joint drift within the recovery window. "
+            "loss pauses motion and disables the active arms. Re-enable requires fresh replies, "
+            "no faults, a stable disabled pose, and valid settling paths within the time window. "
             "State feedback_recoveries counts these pauses. Read the new pose before replanning. "
             "No inter-arm collision model is provided. " + docs_extra,
         )
@@ -316,7 +329,7 @@ class RebotEmbodiment(EmbodimentBase):
             not self.recover_feedback_in_trial
             or self._recovering_feedback
             or self._recovery_error is not None
-            or len(self.sessions) != 2
+            or len(self.sessions) != len(self.configs)
         ):
             return False
         eligible = isinstance(error, native._FeedbackError) or any(
@@ -390,8 +403,8 @@ class RebotEmbodiment(EmbodimentBase):
 
     def _observe_once(self) -> Observation:
         """Return measured arm state and the latest fresh overhead frame."""
-        if len(self.sessions) != 2 or self._camera is None:
-            raise EmbodimentFault("Both arms and the camera must be open")
+        if len(self.sessions) != len(self.configs) or self._camera is None:
+            raise EmbodimentFault("All selected arms and the camera must be open")
         joints, efforts, times = [], [], []
         poses: list[float] = []
         for session, config, kin in zip(self.sessions, self.configs, self.kinematics, strict=True):
@@ -433,9 +446,13 @@ class RebotEmbodiment(EmbodimentBase):
             if self._recovery_error is not None:
                 raise EmbodimentFault(f"Feedback recovery failed: {self._recovery_error}")
             values = np.asarray(action.data, dtype=float)
-            if values.shape != (14,) or not np.isfinite(values).all() or len(self.sessions) != 2:
+            if (
+                values.shape != (7 * len(self.configs),)
+                or not np.isfinite(values).all()
+                or len(self.sessions) != len(self.configs)
+            ):
                 raise EmbodimentFault(
-                    "A paired action requires 14 finite values and two active arms"
+                    f"Action requires {7 * len(self.configs)} finite values and all selected arms"
                 )
             targets: list[list[float]] = []
             diagnostics: list[dict[str, Any]] = []
@@ -452,7 +469,7 @@ class RebotEmbodiment(EmbodimentBase):
                 targets.append([*solution.joints, config.grip_to_motor(float(target[6]))])
                 diagnostics.append(
                     {
-                        "side": ("left", "right")[i],
+                        "side": self.sides[i],
                         "position_error_m": solution.position_error_m,
                         "rotation_error_rad": solution.rotation_error_rad,
                         "ik_converged": solution.converged,

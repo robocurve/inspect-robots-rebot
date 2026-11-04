@@ -257,3 +257,15 @@ checks. A position change above the stability range prevents re-enable.
 The five-second deadline includes these checks. Logs record the original feedback
 error, positions before and after disable, stopping displacement, and stability
 measurements. Failures identify the joint and the measured limit where available.
+
+
+### One-arm operation
+
+Set `active_arms=right` or `active_arms=left` to open only that arm. The default
+is `both`. One-arm mode provides seven action values with the selected side's
+labels and a single row of joint feedback. It does not load the inactive profile,
+open its CAN bus, read or acknowledge its stop record, or report false feedback
+for it. Recovery and shutdown cover only the selected arm. The station must
+isolate the inactive arm and place it clear of the active workspace. Update the
+encoder and decoder task descriptions and expected shutdown report count for
+one-arm operation; do not mix its results with paired trials.
