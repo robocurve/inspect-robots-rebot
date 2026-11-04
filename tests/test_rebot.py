@@ -634,3 +634,45 @@ def test_wrist_margin_bounds_ik_without_changing_motor_profile(config):
     assert plain.lower[4] == config.axes[4]["lower"]
     assert kin.lower[:4] == pytest.approx(plain.lower[:4])
     assert kin.upper[5] == plain.upper[5]
+
+
+def test_reduced_joint2_upper_tolerance_only(session):
+    session.joints[1]["upper"] = 1.6
+    session.joint2_upper_tolerance_rad = 0.012
+    session._motors[1].position = 1.6103458404541016
+    session.feedback()
+    session._motors[1].position = 1.6121
+    with pytest.raises(Exception, match="joint2: measured position outside bounds"):
+        session.feedback()
+    session._motors[1].position = -0.0101
+    with pytest.raises(Exception, match="joint2: measured position outside bounds"):
+        session.feedback()
+    session._motors[1].position = 0
+    session._motors[4].position = session.joints[4]["lower"] - 0.0101
+    with pytest.raises(Exception, match="joint5: measured position outside bounds"):
+        session.feedback()
+
+
+@pytest.mark.parametrize("tolerance", [0.009, 0.013, float("nan"), float("inf"), 0.012])
+def test_tolerance_cannot_expand_stock_joint_range(config, tmp_path, tolerance):
+    with pytest.raises(ValueError):
+        StreamingSession(config.profile, config.state_dir, joint2_upper_tolerance_rad=tolerance)
+    with pytest.raises(ValueError):
+        RebotEmbodiment(state_dir=str(tmp_path), joint2_upper_tolerance_rad=tolerance)
+
+
+def test_reduced_joint2_range_accepts_narrow_tolerance(config, tmp_path):
+    profile = json.loads(json.dumps(config.profile))
+    profile["joints"][1]["upper"] = 1.6
+    path = tmp_path / "reduced.json"
+    path.write_text(json.dumps(profile))
+    e = RebotEmbodiment(
+        left_profile=str(path),
+        right_profile=str(path),
+        state_dir=str(tmp_path / "pair"),
+        joint2_upper_tolerance_rad=0.012,
+    )
+    assert e.joint2_upper_tolerance_rad == 0.012
+    s = StreamingSession(profile, config.state_dir, joint2_upper_tolerance_rad=0.012)
+    assert s.joint2_upper_tolerance_rad == 0.012
+    assert s.joints[1]["upper"] == 1.6

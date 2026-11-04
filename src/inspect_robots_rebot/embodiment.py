@@ -55,6 +55,7 @@ class RebotEmbodiment(EmbodimentBase):
         motor_temp_limit: float = 80,
         tool_floor_m: float = 0.12,
         wrist_yaw_command_margin_rad: float = 0.0,
+        joint2_upper_tolerance_rad: float = 0.01,
         command_mode: str = "measured",
         command_step_rad: float = 0.2,
         command_resync_rad: float = 0.35,
@@ -96,6 +97,14 @@ class RebotEmbodiment(EmbodimentBase):
         ]
         if self.configs[0].state_dir == self.configs[1].state_dir:
             raise ValueError("Each arm requires its own persistent stop directory")
+        tolerance = joint2_upper_tolerance_rad
+        if not np.isfinite(tolerance) or not 0.01 <= tolerance <= 0.012:
+            raise ValueError("Joint 2 upper tolerance must be between 0.010 and 0.012 rad")
+        if tolerance > 0.01 and any(
+            c.axes[1]["upper"] + tolerance > np.deg2rad(170) for c in self.configs
+        ):
+            raise ValueError("Extra tolerance requires a reduced joint 2 operating range")
+        self.joint2_upper_tolerance_rad = tolerance
         margin = wrist_yaw_command_margin_rad
         if (
             not np.isfinite(margin)
@@ -207,6 +216,7 @@ class RebotEmbodiment(EmbodimentBase):
                     home_wait=240,
                     motor_temp_limit=self.motor_temp_limit,
                     pair_stop=pair_stop,
+                    joint2_upper_tolerance_rad=self.joint2_upper_tolerance_rad,
                     **self.command_options,
                 )
                 self.sessions.append(session)

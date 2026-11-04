@@ -168,3 +168,10 @@ This matches the shipped profile. It does not specify allowable dynamic
 overshoot beyond that range. A station can use endpoint clearance to allow
 tracking error without commanding the exact range endpoint. Clearance requires
 hardware validation and is not a replacement for the measured-position stop.
+
+For an installation with a reduced joint 2 operating range,
+`joint2_upper_tolerance_rad` can be set from 0.010 to 0.012 rad. The default is
+0.010 rad. A larger value is rejected unless the upper command bound plus the
+tolerance remains inside the stock profile's 170-degree upper bound. This
+option changes only the upper measured-position allowance for joint 2.
+It does not change commands, lower bounds, other joints, or other fault checks.

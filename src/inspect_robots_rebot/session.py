@@ -30,6 +30,7 @@ class StreamingSession(native.ArmSession):
         *args: Any,
         motor_temp_limit: float = 80.0,
         pair_stop: threading.Event | None = None,
+        joint2_upper_tolerance_rad: float = native.BOUNDS_TOLERANCE,
         command_mode: str = "measured",
         command_step_rad: float = 0.2,
         command_resync_rad: float = 0.35,
@@ -44,6 +45,14 @@ class StreamingSession(native.ArmSession):
             raise ValueError("Command limits must be finite and positive")
         if command_step_rad + command_resync_rad >= native.MAX_EXCURSION:
             raise ValueError("Command limits must leave room inside the native fault envelope")
+        tolerance = joint2_upper_tolerance_rad
+        if not math.isfinite(tolerance) or not native.BOUNDS_TOLERANCE <= tolerance <= 0.012:
+            raise ValueError("Joint 2 upper tolerance must be between 0.010 and 0.012 rad")
+        if tolerance > native.BOUNDS_TOLERANCE and self.joints[1][
+            "upper"
+        ] + tolerance > math.radians(170):
+            raise ValueError("Extra tolerance requires a reduced joint 2 operating range")
+        self.joint2_upper_tolerance_rad = tolerance
         self.command_mode = command_mode
         self.command_step_rad = command_step_rad
         self.command_resync_rad = command_resync_rad
@@ -99,10 +108,15 @@ class StreamingSession(native.ArmSession):
                     raise native._EnvelopeError(
                         f"{axis['name']}: temperature stop ({temperature:.1f} C)"
                     )
+                upper_tolerance = (
+                    self.joint2_upper_tolerance_rad
+                    if axis["name"] == "joint2"
+                    else native.BOUNDS_TOLERANCE
+                )
                 if (
                     not axis["lower"] - native.BOUNDS_TOLERANCE
                     <= pos
-                    <= axis["upper"] + native.BOUNDS_TOLERANCE
+                    <= axis["upper"] + upper_tolerance
                 ):
                     raise native._EnvelopeError(f"{axis['name']}: measured position outside bounds")
                 over_cap |= abs(effort) > cap
