@@ -1,3 +1,15 @@
+# Robocurve reBot adapter
+
+This repository adds the two-arm `rebot_arms` embodiment as a counterpart to
+`yam_arms`. See [the adapter guide](docs/adapter.md) for installation, action units,
+control limits, driver requirements, migration, and qualification.
+
+The distribution is `inspect-robots-rebot`. It retains the original `b601` entry
+point and operator CLI. The single-arm documentation below describes that legacy
+interface. Use this repository package for the new paired interface.
+
+---
+
 <div align="center">
 
 <img src="https://raw.githubusercontent.com/kyeshmz/inspect-robots-b601/main/docs/assets/banner.svg" alt="Inspect Robots × B601: the Inspect Robots logo beside a line-art B601 arm reaching for the same dot" width="100%">

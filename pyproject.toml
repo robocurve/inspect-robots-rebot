@@ -3,7 +3,7 @@ requires = ["hatchling>=1.18", "hatch-vcs>=0.3", "hatch-fancy-pypi-readme>=24.1"
 build-backend = "hatchling.build"
 
 [project]
-name = "inspect-robots-b601"
+name = "inspect-robots-rebot"
 dynamic = ["version", "readme"]
 description = "Inspect Robots adapter for Seeed reBot Arm B601-RS arms driven directly over SocketCAN."
 requires-python = ">=3.10,<3.14"
@@ -27,6 +27,8 @@ dependencies = ["inspect-robots>=0.60", "numpy>=1.24,<3", "pillow>=10,<13"]
 motorbridge = ["motorbridge==0.5.6"]
 # Inspect Robots's LLM agent policy, used by `inspect-robots-b601 agent`.
 agent = ["inspect-robots-agent>=0.28"]
+cartesian = ["scipy>=1.11,<2"]
+cameras = ["opencv-python-headless>=4.8,<5"]
 dev = [
     "pytest>=8.0",
     "pytest-cov>=5.0",
@@ -34,27 +36,30 @@ dev = [
     "mypy>=1.11",
     "pre-commit>=3.5",
     "build>=1.2",
+    "scipy>=1.11,<2",
+    "numpy<2.5",
 ]
 
 [project.urls]
-Homepage = "https://github.com/kyeshmz/inspect-robots-b601"
-Issues = "https://github.com/kyeshmz/inspect-robots-b601/issues"
+Homepage = "https://github.com/robocurve/inspect-robots-rebot"
+Issues = "https://github.com/robocurve/inspect-robots-rebot/issues"
 Framework = "https://github.com/robocurve/inspect-robots"
 Motorbridge = "https://motorbridge.seeedstudio.com"
 
 # Inspect Robots discovers this by entry point; no import needed for `inspect-robots list`.
 [project.entry-points."inspect_robots.embodiments"]
 b601 = "inspect_robots_b601.embodiment:B601Embodiment"
+rebot_arms = "inspect_robots_rebot.embodiment:RebotEmbodiment"
 
 [project.scripts]
 inspect-robots-b601 = "inspect_robots_b601.cli:main"
 inspect-robots-b601-preflight = "inspect_robots_b601.preflight:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/inspect_robots_b601"]
+packages = ["src/inspect_robots_b601", "src/inspect_robots_rebot"]
 
 [tool.hatch.build.targets.sdist]
-include = ["/src/inspect_robots_b601", "/tests", "/README.md", "/LICENSE"]
+include = ["/src/inspect_robots_b601", "/src/inspect_robots_rebot", "/docs", "/tests", "/README.md", "/LICENSE"]
 
 
 # ---------------------------------------------------------------------------
@@ -92,7 +97,7 @@ addopts = "-ra --strict-markers --ignore=tests/packaging"
 
 [tool.coverage.run]
 branch = true
-source = ["inspect_robots_b601"]
+source = ["inspect_robots_b601", "inspect_robots_rebot"]
 
 [tool.coverage.report]
 # The siblings gate at 100%. This floor only ratchets up: the RealSense camera and the
@@ -140,10 +145,10 @@ replacement = '> **Caution:**'
 [tool.mypy]
 python_version = "3.10"
 strict = true
-files = ["src/inspect_robots_b601"]
+files = ["src/inspect_robots_b601", "src/inspect_robots_rebot"]
 
 # Motorbridge ships no type information, and the RealSense modules are system packages
 # imported lazily on the camera path.
 [[tool.mypy.overrides]]
-module = ["motorbridge", "motorbridge.*", "pyrealsense2", "pyrealsense2.*", "rs_depth"]
+module = ["motorbridge", "motorbridge.*", "pyrealsense2", "pyrealsense2.*", "rs_depth", "scipy.*", "cv2.*"]
 ignore_missing_imports = true
