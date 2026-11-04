@@ -341,7 +341,8 @@ class RebotEmbodiment(EmbodimentBase):
                 s.pair_stop.set()
             with ThreadPoolExecutor(max_workers=2) as pool:
                 futures = [
-                    pool.submit(s.prepare_feedback_recovery, deadline) for s in self.sessions
+                    pool.submit(s.prepare_feedback_recovery, deadline, kin.validate_path)
+                    for s, kin in zip(self.sessions, self.kinematics, strict=True)
                 ]
                 prepared = [future.result() for future in futures]
             if self._camera is None:

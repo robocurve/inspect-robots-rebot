@@ -403,7 +403,11 @@ class StreamingSession(native.ArmSession):
             "retry_errors": last_errors,
         }
 
-    def prepare_feedback_recovery(self, deadline: float) -> tuple[Feedback, dict[str, Any]]:
+    def prepare_feedback_recovery(
+        self,
+        deadline: float,
+        validate: Callable[[Sequence[float], Sequence[float]], None] | None = None,
+    ) -> tuple[Feedback, dict[str, Any]]:
         """Stop the loop and confirm fresh disabled state; do not clear or enable."""
         self._recovery_deadline = deadline
         self._stop.set()
@@ -439,21 +443,24 @@ class StreamingSession(native.ArmSession):
                     b - a for a, b in zip(self._last_good_positions, anchor, strict=True)
                 ],
             )
+            previous = anchor
+            if validate is not None:
+                validate(anchor, anchor)
             stable_since = time.monotonic()
             low, high = list(anchor), list(anchor)
             samples = 0
             while True:
                 sample = self._read_disabled_recovery(deadline)
+                if validate is not None:
+                    validate(previous, sample.positions)
+                self._log(
+                    "feedback-recovery-settling",
+                    positions_rad=sample.positions,
+                    displacement_rad=[b - a for a, b in zip(anchor, sample.positions, strict=True)],
+                )
+                previous = sample.positions
                 samples += 1
                 for i, position in enumerate(sample.positions):
-                    drift = abs(position - anchor[i])
-                    limit = 0.05 if i < 6 else 0.3
-                    if drift > limit:
-                        raise RuntimeError(
-                            f"{self.joints[i]['name']}: motion after confirmed disable; "
-                            f"reference={anchor[i]:.6f}, measured={position:.6f}, "
-                            f"change={drift:.6f}, limit={limit:.6f} rad"
-                        )
                     low[i], high[i] = min(low[i], position), max(high[i], position)
                 if any(
                     b - a > (0.01 if i < 6 else 0.05)

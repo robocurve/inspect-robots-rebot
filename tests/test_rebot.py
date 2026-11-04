@@ -1059,3 +1059,30 @@ def test_recovery_validation_failure_keeps_both_arms_disabled(tmp_path, problem)
                 e.close()
         else:
             e.close()
+
+
+def test_disabled_settling_larger_than_old_drift_limit_recovers(tmp_path):
+    e, controllers = recovery_pair(tmp_path)
+    motor = controllers[0].motors[0]
+    original = motor.disable
+    calls = 0
+
+    def settle():
+        nonlocal calls
+        original()
+        calls += 1
+        if calls in (2, 3):
+            motor.position += 0.07
+
+    motor.disable = settle
+    try:
+        motor.age = 0.113
+        deadline = time.monotonic() + 3
+        while (
+            not e._feedback_recoveries and e._recovery_error is None and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        assert e._recovery_error is None
+        assert e._feedback_recoveries == 1
+    finally:
+        e.close()
