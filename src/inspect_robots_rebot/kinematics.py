@@ -45,7 +45,10 @@ class Solution:
 class Kinematics:
     """Use YAM's base-frame and trial-relative yaw, pitch, and roll convention."""
 
-    def __init__(self, config: ArmConfig) -> None:
+    def __init__(self, config: ArmConfig, *, tool_floor_m: float = 0.12) -> None:
+        if not np.isfinite(tool_floor_m) or tool_floor_m >= 0.6:
+            raise ValueError("tool_floor_m must be finite and below the 0.6 m upper bound")
+        self.tool_floor_m = float(tool_floor_m)
         # Optional dependency: only Cartesian reset loads the solver.
         from scipy.optimize import least_squares
         from scipy.spatial.transform import Rotation
@@ -114,5 +117,7 @@ class Kinematics:
         """Reject a commanded joint segment that crosses the declared tool floor."""
         start_q, target_q = np.asarray(start)[:6], np.asarray(target)[:6]
         for fraction in np.linspace(0, 1, 31):
-            if fk(start_q + fraction * (target_q - start_q))[2, 3] < 0.12:
-                raise ValueError("Commanded joint segment crosses the 0.12 m tool floor")
+            if fk(start_q + fraction * (target_q - start_q))[2, 3] < self.tool_floor_m:
+                raise ValueError(
+                    f"Commanded joint segment crosses the {self.tool_floor_m:g} m tool floor"
+                )

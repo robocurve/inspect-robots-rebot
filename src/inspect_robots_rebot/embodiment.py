@@ -53,6 +53,7 @@ class RebotEmbodiment(EmbodimentBase):
         camera_url: str = "",
         allow_motion: bool = False,
         motor_temp_limit: float = 80,
+        tool_floor_m: float = 0.12,
         control_interface: str = "eef_pos",
         report_joint_eff: bool = True,
         docs_extra: str = "",
@@ -65,6 +66,9 @@ class RebotEmbodiment(EmbodimentBase):
             raise ValueError("Left and right arms require distinct CAN interfaces")
         if not np.isfinite(motor_temp_limit) or not 0 < motor_temp_limit <= 80:
             raise ValueError("motor_temp_limit must be in (0, 80] C")
+        if not np.isfinite(tool_floor_m) or tool_floor_m >= 0.6:
+            raise ValueError("tool_floor_m must be finite and below the 0.6 m upper bound")
+        self.tool_floor_m = float(tool_floor_m)
         self.configs = [
             load_arm(
                 left_profile, left_channel, Path(left_state_dir or str(Path(state_dir) / "left"))
@@ -90,7 +94,24 @@ class RebotEmbodiment(EmbodimentBase):
         self._init_pose: Any = None
         self._report_effort = report_joint_eff
         # This is the declared operating box, not a guarantee of IK reachability.
-        self.low = np.array([0.08, -0.4, 0.12, -np.pi, 0, 0, 0, 0.08, -0.08, 0.12, -np.pi, 0, 0, 0])
+        self.low = np.array(
+            [
+                0.08,
+                -0.4,
+                self.tool_floor_m,
+                -np.pi,
+                0,
+                0,
+                0,
+                0.08,
+                -0.08,
+                self.tool_floor_m,
+                -np.pi,
+                0,
+                0,
+                0,
+            ]
+        )
         self.high = np.array([0.6, 0.05, 0.6, np.pi, 0, 0, 1, 0.6, 0.4, 0.6, np.pi, 0, 0, 1])
         fields = [
             StateField("joint_pos", (2, 7), "rad+normalized"),
@@ -148,7 +169,9 @@ class RebotEmbodiment(EmbodimentBase):
                 factory = self._camera_factory
             self._camera = factory(self.camera_url)
             self._camera.get()
-            self.kinematics = [Kinematics(config) for config in self.configs]
+            self.kinematics = [
+                Kinematics(config, tool_floor_m=self.tool_floor_m) for config in self.configs
+            ]
             for config in self.configs:
                 session = self._session_factory(
                     config.profile,

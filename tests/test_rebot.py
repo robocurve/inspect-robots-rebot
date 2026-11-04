@@ -517,3 +517,47 @@ def test_pair_stop_does_not_interrupt_native_parking(session):
     session.pair_stop.set()
     session._parking = True
     session._check_envelope()
+
+
+@pytest.mark.parametrize("floor", [0.12, -0.02, 0.03])
+def test_tool_floor_controls_action_bounds_and_solver(tmp_path, floor):
+    e = RebotEmbodiment(
+        allow_motion=True,
+        state_dir=str(tmp_path),
+        session_factory=Arm,
+        camera_factory=Camera,
+        tool_floor_m=floor,
+    )
+    assert e.info.action_space.low[2] == floor
+    assert e.info.action_space.low[9] == floor
+    e.reset(Scene(id="floor", instruction="test"))
+    assert all(k.tool_floor_m == floor for k in e.kinematics)
+    e.close()
+
+
+@pytest.mark.parametrize("floor", [float("nan"), float("inf"), 0.6, 0.7])
+def test_invalid_tool_floor(config, floor):
+    with pytest.raises(ValueError, match="tool_floor_m"):
+        RebotEmbodiment(tool_floor_m=floor)
+    with pytest.raises(ValueError, match="tool_floor_m"):
+        Kinematics(config, tool_floor_m=floor)
+
+
+def test_path_uses_configured_floor(config, monkeypatch):
+    import inspect_robots_rebot.kinematics as module
+
+    height = [0.0]
+
+    def pose(q):
+        result = np.eye(4)
+        result[2, 3] = height[0]
+        return result
+
+    monkeypatch.setattr(module, "fk", pose)
+    relaxed = Kinematics(config, tool_floor_m=-0.02)
+    relaxed.validate_path([0] * 6, [0.01] * 6)
+    with pytest.raises(ValueError, match=r"0\.12 m"):
+        Kinematics(config).validate_path([0] * 6, [0.01] * 6)
+    height[0] = -0.021
+    with pytest.raises(ValueError, match=r"-0\.02 m"):
+        relaxed.validate_path([0] * 6, [0.01] * 6)

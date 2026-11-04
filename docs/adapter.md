@@ -42,6 +42,7 @@ robot = RebotEmbodiment(
     right_state_dir="/site/state/right",
     camera_url="http://camera-host:1984/api/stream.mjpeg?src=top",
     motor_temp_limit=80,
+    tool_floor_m=0.12,  # Set from the installation base-frame/tabletop calibration.
     allow_motion=False,
 )
 ```
@@ -70,7 +71,11 @@ before configuration; interface names alone do not prove arm identity.
 - No additional velocity, acceleration, or jerk planner runs on policy targets.
   The tracking allowance still affects attainable speed. Native homing retains
   its separate slow path behavior. This does not promise YAM's physical speed.
-- The sampled commanded joint segment must keep the tool above 0.12 m. This is
+- `tool_floor_m` sets both arms' lower Cartesian target bound and the sampled
+  joint-path floor. Its default is 0.12 m. Values are in each arm's base frame.
+  A station with the same mounting reference as rig 1 can set `tool_floor_m=-0.02`
+  to match rig 1's configured target lower bound. Confirm the tabletop height
+  before transferring a value between installations. This sampled tool check is
   not a complete collision check. There is no inter-arm or whole-link model.
 - The default temperature stop is 80 C. Torque caps, joint bounds, motor status,
   fresh feedback and the motor command watchdog remain active.
