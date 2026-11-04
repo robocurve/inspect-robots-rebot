@@ -888,10 +888,16 @@ def test_113ms_recovers_during_model_inference_without_ending_trial(tmp_path):
 
 @pytest.mark.parametrize("problem", ["pose", "disconnect", "fault"])
 def test_failed_feedback_recovery_never_reenables(tmp_path, problem):
-    e, controllers = recovery_pair(tmp_path, timeout=0.3)
+    e, controllers = recovery_pair(tmp_path, timeout=1)
     motor = controllers[0].motors[0]
     if problem == "pose":
-        motor.shift_on_disable = 0.2
+        original_disable = motor.disable
+
+        def moving_while_disabled():
+            original_disable()
+            motor.position += 0.02
+
+        motor.disable = moving_while_disabled
     if problem == "disconnect":
         motor.disable_fails = True
     if problem == "fault":
@@ -942,3 +948,114 @@ def test_feedback_can_return_after_four_seconds_without_new_trial(tmp_path):
 def test_invalid_feedback_recovery_window(timeout):
     with pytest.raises(ValueError, match="feedback_recovery_timeout_s"):
         RebotEmbodiment(feedback_recovery_timeout_s=timeout)
+
+
+@pytest.mark.parametrize("displacement", [0.06, 0.15, -0.15])
+def test_stopping_motion_before_disabled_reference_can_recover(tmp_path, displacement):
+    e, controllers = recovery_pair(tmp_path)
+    motor = controllers[0].motors[0]
+    events = []
+    original_log = e.sessions[0]._log
+
+    def record(status, **details):
+        events.append((status, details))
+        original_log(status, **details)
+
+    e.sessions[0]._log = record
+    try:
+        motor.shift_on_disable = displacement
+        motor.age = 0.113
+        deadline = time.monotonic() + 3
+        while (
+            not e._feedback_recoveries and e._recovery_error is None and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        assert e._recovery_error is None
+        assert e._feedback_recoveries == 1
+        stable = next(details for status, details in events if status == "feedback-recovery-stable")
+        assert stable["stable_s"] >= 0.25 and stable["samples"] >= 3
+        stopped = next(
+            details for status, details in events if status == "feedback-recovery-disabled"
+        )
+        assert abs(stopped["stopping_displacement_rad"][0] - displacement) < 0.001
+        assert any(
+            status == "feedback-interrupted" and "0.113" in details["error"]
+            for status, details in events
+        )
+    finally:
+        e.close()
+
+
+def test_pose_change_during_camera_check_prevents_enable(tmp_path):
+    e, controllers = recovery_pair(tmp_path)
+    camera_get = e._camera.get
+    motor = controllers[0].motors[0]
+
+    def moved_camera_read():
+        image = camera_get()
+        if not motor.enabled:
+            motor.position += 0.03
+        return image
+
+    e._camera.get = moved_camera_read
+    try:
+        motor.age = 0.113
+        deadline = time.monotonic() + 3
+        while e._recovery_error is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert "pose changed after recovery validation" in str(e._recovery_error)
+        assert all(m.enable_count == 1 for c in controllers for m in c.motors)
+    finally:
+        e.close()
+
+
+@pytest.mark.parametrize("problem", ["sequence", "stop_record", "floor"])
+def test_recovery_validation_failure_keeps_both_arms_disabled(tmp_path, problem):
+    e, controllers = recovery_pair(tmp_path)
+    motor = controllers[0].motors[0]
+    original = motor.disable
+    camera_get = e._camera.get
+
+    def unchanged_sequence():
+        sequence = motor.sequence
+        original()
+        motor.sequence = sequence
+
+    def changed_during_camera():
+        image = camera_get()
+        if problem == "stop_record":
+            e.sessions[0]._ledger.stop("external stop", details={})
+        return image
+
+    if problem == "sequence":
+        e.sessions[0].feedback_recovery_timeout_s = 0.1
+        motor.disable = unchanged_sequence
+    elif problem == "stop_record":
+        e._camera.get = changed_during_camera
+    else:
+        from inspect_robots_rebot.kinematics import PathRejected
+
+        def floor_rejected(start, end):
+            raise PathRejected("test: stopped pose below floor")
+
+        e.kinematics[0].validate_path = floor_rejected
+    try:
+        motor.age = 0.113
+        deadline = time.monotonic() + 3
+        while e._recovery_error is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert e._recovery_error is not None
+        assert e._feedback_recoveries == 0
+        expected = {
+            "sequence": "confirmed disable",
+            "stop_record": "Stop evidence changed",
+            "floor": "below floor",
+        }
+        assert expected[problem] in str(e._recovery_error)
+        assert all(m.enable_count == 1 for c in controllers for m in c.motors)
+    finally:
+        if problem == "sequence":
+            with pytest.raises(EmbodimentFault):
+                e.close()
+        else:
+            e.close()

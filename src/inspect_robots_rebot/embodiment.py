@@ -331,6 +331,12 @@ class RebotEmbodiment(EmbodimentBase):
         deadline = (min(losses) if losses else time.monotonic()) + self.feedback_recovery_timeout_s
         try:
             for s in self.sessions:
+                s._log(
+                    "feedback-recovery-start",
+                    trigger=str(error),
+                    original_error=str(s._failure),
+                    remaining_s=max(0.0, deadline - time.monotonic()),
+                )
                 s.pair_feedback_stop.set()
                 s.pair_stop.set()
             with ThreadPoolExecutor(max_workers=2) as pool:
@@ -345,8 +351,10 @@ class RebotEmbodiment(EmbodimentBase):
                 kin.validate_path(sample.positions, sample.positions)
             if time.monotonic() >= deadline:
                 raise RuntimeError("Feedback recovery timed out")
-            for session, (sample, ledger) in zip(self.sessions, prepared, strict=True):
-                session.accept_feedback_recovery(sample, ledger)
+            for session, kin, (sample, ledger) in zip(
+                self.sessions, self.kinematics, prepared, strict=True
+            ):
+                session.accept_feedback_recovery(sample, ledger, validate=kin.validate_path)
             for s in self.sessions:
                 s.pair_feedback_stop.clear()
                 s.pair_stop.clear()
@@ -367,7 +375,14 @@ class RebotEmbodiment(EmbodimentBase):
                     s._thread.join(timeout=2)
                 with s._condition:
                     s._disable()
-                    s._latch("feedback recovery failed", {"error": str(recovery_error)})
+                    s._latch(
+                        "feedback recovery failed",
+                        {
+                            "error": str(recovery_error),
+                            "trigger": str(error),
+                            "original_error": str(s._failure),
+                        },
+                    )
             raise
         finally:
             self._recovering_feedback = False

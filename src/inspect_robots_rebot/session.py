@@ -311,7 +311,13 @@ class StreamingSession(native.ArmSession):
                         f"limit={envelope:.3f} rad"
                     )
             self._relieve_stalls(sample)
-        except native._FeedbackError:
+        except native._FeedbackError as error:
+            if self.feedback_loss_at is None:
+                self._log(
+                    "feedback-interrupted",
+                    error=str(error),
+                    positions_rad=self._last_good_positions,
+                )
             self.feedback_loss_at = self.feedback_loss_at or time.monotonic()
             self.pair_feedback_stop.set()
             self.pair_stop.set()
@@ -419,38 +425,106 @@ class StreamingSession(native.ArmSession):
                 "paired feedback recovery",
             ):
                 raise RuntimeError("Recovery refused for another stop record")
-            for motor in self._motors:
-                if time.monotonic() >= deadline:
-                    raise RuntimeError("Feedback recovery timed out")
-                before = motor.get_state_snapshot()
-                motor.disable()
-                after = motor.get_state_snapshot()
-                if (
-                    before is None
-                    or after is None
-                    or after.feedback_sequence <= before.feedback_sequence
-                    or not 0 <= after.feedback_age_s <= 0.1
-                    or ((after.state.arbitration_id >> 22) & 3) != 0
+            # The first confirmed disabled replies define the stopping reference.
+            # A moving pose from before disable is not a stopped-pose reference.
+            replies = {r["motor_id"]: r["position"] for r in self.shutdown_report["replies"]}
+            anchor = tuple(float(replies[axis["motor_id"]]) for axis in self.joints)
+            self._log(
+                "feedback-recovery-disabled",
+                original_error=str(self._failure),
+                prior_stop=ledger,
+                last_good_positions_rad=self._last_good_positions,
+                disabled_positions_rad=anchor,
+                stopping_displacement_rad=[
+                    b - a for a, b in zip(self._last_good_positions, anchor, strict=True)
+                ],
+            )
+            stable_since = time.monotonic()
+            low, high = list(anchor), list(anchor)
+            samples = 0
+            while True:
+                sample = self._read_disabled_recovery(deadline)
+                samples += 1
+                for i, position in enumerate(sample.positions):
+                    drift = abs(position - anchor[i])
+                    limit = 0.05 if i < 6 else 0.3
+                    if drift > limit:
+                        raise RuntimeError(
+                            f"{self.joints[i]['name']}: motion after confirmed disable; "
+                            f"reference={anchor[i]:.6f}, measured={position:.6f}, "
+                            f"change={drift:.6f}, limit={limit:.6f} rad"
+                        )
+                    low[i], high[i] = min(low[i], position), max(high[i], position)
+                if any(
+                    b - a > (0.01 if i < 6 else 0.05)
+                    for i, (a, b) in enumerate(zip(low, high, strict=True))
                 ):
-                    raise RuntimeError("Fresh disabled replies are required for recovery")
-                fault, warning = motor.robstride_get_fault_report()
-                if fault or warning:
-                    raise RuntimeError("Motor fault or warning prevents recovery")
-            sample = self.feedback(ignore_failure=True)
-            for i, (before, after) in enumerate(
-                zip(self._last_good_positions, sample.positions, strict=True)
-            ):
-                if abs(after - before) > (0.05 if i < 6 else 0.3):
-                    raise RuntimeError("Pose changed too far during feedback recovery")
-            if self._ledger.snapshot() != ledger:
-                raise RuntimeError("Stop evidence changed during recovery")
-            return sample, ledger
+                    stable_since = time.monotonic()
+                    low, high = list(sample.positions), list(sample.positions)
+                    samples = 1
+                if self._ledger.snapshot() != ledger:
+                    raise RuntimeError("Stop evidence changed during recovery")
+                if samples >= 3 and time.monotonic() - stable_since >= 0.25:
+                    self._log(
+                        "feedback-recovery-stable",
+                        positions_rad=sample.positions,
+                        samples=samples,
+                        stable_s=time.monotonic() - stable_since,
+                        ranges_rad=[b - a for a, b in zip(low, high, strict=True)],
+                    )
+                    return sample, ledger
+                time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
 
-    def accept_feedback_recovery(self, sample: Feedback, ledger: dict[str, Any]) -> None:
+    def _read_disabled_recovery(self, deadline: float) -> Feedback:
+        """Request new disabled replies and check every motor before recovery."""
+        for axis, motor in zip(self.joints, self._motors, strict=True):
+            if time.monotonic() >= deadline:
+                raise RuntimeError("Feedback recovery timed out while checking disabled stability")
+            before = motor.get_state_snapshot()
+            motor.disable()
+            after = motor.get_state_snapshot()
+            if (
+                before is None
+                or after is None
+                or after.feedback_sequence <= before.feedback_sequence
+                or not 0 <= after.feedback_age_s <= 0.1
+                or ((after.state.arbitration_id >> 22) & 3) != 0
+            ):
+                raise RuntimeError(f"{axis['name']}: fresh disabled reply required for recovery")
+            fault, warning = motor.robstride_get_fault_report()
+            if fault or warning:
+                raise RuntimeError(
+                    f"{axis['name']}: motor fault={fault}, warning={warning} prevents recovery"
+                )
+        if time.monotonic() >= deadline:
+            raise RuntimeError("Feedback recovery timed out")
+        return self.feedback(ignore_failure=True)
+
+    def accept_feedback_recovery(
+        self,
+        sample: Feedback,
+        ledger: dict[str, Any],
+        validate: Callable[[Sequence[float], Sequence[float]], None] | None = None,
+    ) -> None:
         """Acknowledge only the checked stop; prepare to enable at the measured pose."""
         with self._condition:
             if self._ledger is None or self._ledger.snapshot() != ledger:
                 raise RuntimeError("Stop evidence changed before recovery acknowledgement")
+            if self._recovery_deadline is None:
+                raise RuntimeError("Recovery deadline is missing")
+            current = self._read_disabled_recovery(self._recovery_deadline)
+            for i, (before, after) in enumerate(
+                zip(sample.positions, current.positions, strict=True)
+            ):
+                if abs(after - before) > (0.01 if i < 6 else 0.05):
+                    raise RuntimeError(
+                        f"{self.joints[i]['name']}: pose changed after recovery validation"
+                    )
+            if self._ledger.snapshot() != ledger:
+                raise RuntimeError("Stop evidence changed before recovery acknowledgement")
+            if validate is not None:
+                validate(sample.positions, current.positions)
+            sample = current
             self._log("feedback-recovery-ready", positions_rad=sample.positions, prior_stop=ledger)
             self._ledger.acknowledge(
                 details={"feedback_recovery": True, "positions_rad": sample.positions}

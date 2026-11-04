@@ -231,7 +231,7 @@ after the deadline. Motor-driver timeouts remain in effect.
 
 Re-enable requires fresh disabled replies, no fault or warning, unchanged stop
 evidence, a fresh camera frame, and a tool position above the configured floor.
-Each arm joint must remain within 0.05 rad of its last valid position; the gripper
+Each arm joint must remain within 0.05 rad of its first confirmed disabled position; the gripper
 allowance is 0.3 rad. Re-enable starts from measured positions and keeps the
 original home pose and Cartesian orientation reference. An interrupted step is
 discarded. `feedback_recoveries` reports the recovery count to the policy.
@@ -241,3 +241,16 @@ window, other fault, or exhausted recovery budget leaves the arms stopped.
 Recovery does not acknowledge an unrelated stop record. Close cancels recovery
 before re-enable and preserves disable errors. Disabled arms can move under
 load, so some poses will correctly refuse automatic recovery.
+
+
+Recovery uses the first confirmed disabled reply as its position reference.
+Motion before that reply is recorded separately. It does not count as motion
+while disabled. Each arm must then supply at least three sets of new disabled
+replies across 250 ms. The position range must be at most 0.01 rad per arm joint
+and 0.05 rad for the gripper across this interval. Motion after the first disabled
+reply remains limited to 0.05 rad per arm joint and 0.3 rad for the gripper.
+The controller checks fresh disabled replies again after the camera and floor
+checks. A position change above the stability range prevents re-enable.
+The five-second deadline includes these checks. Logs record the original feedback
+error, positions before and after disable, stopping displacement, and stability
+measurements. Failures identify the joint and the measured limit where available.
