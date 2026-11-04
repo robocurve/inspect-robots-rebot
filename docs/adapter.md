@@ -149,7 +149,7 @@ Joint position bounds and feedback checks remain active. Rejected paths do
 not advance the issued-command reference. Step records include requested and
 issued motor targets, command limiting, reference resets, and elapsed time.
 
-The previous-command option has software tests only. It is not a
-hardware-qualified setting. Resolve boundary overshoot before speed
-qualification. Compare equivalent interior-workspace trajectories and measure
+Both command modes passed small near-home checks on one installation.
+This does not qualify arbitrary trajectories or prove speed parity. Resolve
+boundary overshoot before full-workspace speed qualification. Compare equivalent interior-workspace trajectories and measure
 actual movement time separately from model inference time.
